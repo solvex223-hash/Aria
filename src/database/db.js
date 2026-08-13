@@ -1,4 +1,4 @@
-const sqlite3 = require("sqlite3").verbose();
+const Database = require("better-sqlite3");
 const path = require("path");
 const fs = require("fs");
 
@@ -6,19 +6,21 @@ const fs = require("fs");
 const dataDir = path.join(__dirname, "../../data");
 
 if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir);
+  fs.mkdirSync(dataDir, { recursive: true });
 }
 
 // Database path
 const dbPath = path.join(dataDir, "aria.db");
 
 // Create/Open database
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error("❌ Database connection failed:", err.message);
-  } else {
-    console.log("🗄️ SQLite database connected.");
-  }
-});
+let db;
+try {
+  db = new Database(dbPath);
+  db.pragma("journal_mode = WAL");
+  console.log("🗄️ SQLite database connected.");
+} catch (err) {
+  console.error("❌ Database connection failed:", err.message);
+  throw err;
+}
 
 module.exports = db;

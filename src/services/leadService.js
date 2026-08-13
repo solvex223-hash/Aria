@@ -4,39 +4,41 @@ async function saveLead(phone, lead) {
 
     return new Promise((resolve, reject) => {
 
-        db.run(
-            `
-            INSERT INTO leads (
+        try {
 
-                phone,
-                name,
-                business,
-                industry,
-                location,
-                interested_service,
-                budget,
-                lead_score,
-                needs_human
+            const stmt = db.prepare(`
+                INSERT INTO leads (
 
-            )
+                    phone,
+                    name,
+                    business,
+                    industry,
+                    location,
+                    interested_service,
+                    budget,
+                    lead_score,
+                    needs_human
 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                )
 
-            ON CONFLICT(phone)
-            DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 
-            name = excluded.name,
-            business = excluded.business,
-            industry = excluded.industry,
-            location = excluded.location,
-            interested_service = excluded.interested_service,
-            budget = excluded.budget,
-            lead_score = excluded.lead_score,
-            needs_human = excluded.needs_human,
-            updated_at = CURRENT_TIMESTAMP
+                ON CONFLICT(phone)
+                DO UPDATE SET
 
-            `,
-            [
+                name = excluded.name,
+                business = excluded.business,
+                industry = excluded.industry,
+                location = excluded.location,
+                interested_service = excluded.interested_service,
+                budget = excluded.budget,
+                lead_score = excluded.lead_score,
+                needs_human = excluded.needs_human,
+                updated_at = CURRENT_TIMESTAMP
+
+            `);
+
+            stmt.run(
 
                 phone,
                 lead.name,
@@ -48,17 +50,15 @@ async function saveLead(phone, lead) {
                 lead.leadScore,
                 lead.needsHuman ? 1 : 0
 
-            ],
+            );
 
-            (err) => {
+            resolve();
 
-                if (err) return reject(err);
+        } catch (err) {
 
-                resolve();
+            reject(err);
 
-            }
-
-        );
+        }
 
     });
 

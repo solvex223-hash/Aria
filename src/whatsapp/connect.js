@@ -6,9 +6,13 @@ const {
 
 const { Boom } = require("@hapi/boom");
 const P = require("pino");
-const qrcode = require("qrcode-terminal");
 
 const handleMessage = require("./listener");
+
+// Your WhatsApp number in international format, no + or spaces.
+// e.g. for +234 812 345 6789 -> "2348123456789"
+// Set this in Render's Environment tab as WHATSAPP_PHONE_NUMBER
+const PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER;
 
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState("auth");
@@ -19,6 +23,29 @@ async function startWhatsApp() {
     printQRInTerminal: false,
   });
 
+  // If we're not already registered/paired, request a pairing code
+  // instead of waiting for a QR code.
+  if (!sock.authState?.creds?.registered) {
+    if (!PHONE_NUMBER) {
+      console.error(
+        "❌ WHATSAPP_PHONE_NUMBER env var is not set. Add it in Render's Environment tab (e.g. 2348123456789) to request a pairing code."
+      );
+    } else {
+      // Small delay to let the socket initialize before requesting
+      setTimeout(async () => {
+        try {
+          const code = await sock.requestPairingCode(PHONE_NUMBER);
+          console.log("📱 Your WhatsApp pairing code is:", code);
+          console.log(
+            "➡️  On your phone: WhatsApp > Settings > Linked Devices > Link a Device > Link with phone number instead"
+          );
+        } catch (err) {
+          console.error("❌ Failed to request pairing code:", err.message);
+        }
+      }, 3000);
+    }
+  }
+
   // Handle incoming messages
   sock.ev.on("messages.upsert", async (message) => {
     await handleMessage(sock, message);
@@ -26,13 +53,7 @@ async function startWhatsApp() {
 
   // Connection updates
   sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.clear();
-      console.log("📱 Scan this QR Code with WhatsApp:\n");
-      qrcode.generate(qr, { small: true });
-    }
+    const { connection, lastDisconnect } = update;
 
     if (connection === "open") {
       console.log("✅ Aria is connected to WhatsApp!");

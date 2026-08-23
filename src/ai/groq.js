@@ -9,7 +9,7 @@ const groq = new Groq({
 async function askGroq(systemPrompt, messages = []) {
     try {
         const completion = await groq.chat.completions.create({
-            model: process.env.MODEL || "llama-3.3-70b-versatile",
+            model: process.env.MODEL || "openai/gpt-oss-120b", // llama-3.3-70b-versatile was deprecated Aug 2026
             temperature: 0.7,
             max_tokens: 800,
             response_format: {

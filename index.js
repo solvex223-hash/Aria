@@ -4,7 +4,7 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = baile
 const { Boom } = require("@hapi/boom");
 const qrcode = require("qrcode-terminal");
 
-const { handleAdmin } = require("./handlers/admin");
+const { handleAdmin } = require("./src/handlers/admin");
 const { handleCustomer } = require("./handlers/customer");
 const { isAllowed, getSetting } = require("./database/db");
 

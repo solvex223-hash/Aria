@@ -5,7 +5,7 @@ const { Boom } = require("@hapi/boom");
 const qrcode = require("qrcode-terminal");
 
 const { handleAdmin } = require("./src/handlers/admin");
-const { handleCustomer } = require("./handlers/customer");
+const { handleCustomer } = require("./src/handlers/customer");
 const { isAllowed, getSetting } = require("./database/db");
 
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || "").replace(/\D/g, "");

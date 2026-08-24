@@ -17,10 +17,6 @@ function normalizeNumber(n) {
   return n.replace(/\D/g, "");
 }
 
-// WhatsApp increasingly sends an opaque @lid identifier instead of the real
-// phone number. When that happens, Baileys provides the real number in
-// key.remoteJidAlt — fall back to that instead of parsing the LID as if it
-// were a phone number.
 function getRealSenderJid(key) {
   if (key.remoteJid?.endsWith("@lid") && key.remoteJidAlt) {
     return key.remoteJidAlt;
@@ -39,6 +35,13 @@ async function startBot() {
   const sock = makeWASocket({ auth: state });
 
   sock.ev.on("creds.update", saveCreds);
+
+  if (!sock.authState.creds.registered) {
+    const phoneNumber = ADMIN_NUMBER;
+    const code = await sock.requestPairingCode(phoneNumber);
+    console.log("🔗 Your pairing code:", code);
+    console.log("On your phone: WhatsApp > Settings > Linked Devices > Link a Device > Link with phone number instead");
+  }
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -67,27 +70,22 @@ async function startBot() {
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
     if (!text) return;
 
-    // Admin commands (self-chat, starts with "/")
     if (senderNumber === ADMIN_NUMBER && text.trim().startsWith("/")) {
       return handleAdmin(sock, sender, text);
     }
 
-    // STOP keyword
     if (text.trim().toUpperCase() === "STOP") {
-      const { removeAllowed } = require("./database/db");
+      const { removeAllowed } = require("./src/database/db");
       removeAllowed(senderNumber);
       await sock.sendMessage(sender, { text: "You've been unsubscribed. Take care!" });
       return;
     }
 
-    // Permission check
     const allowAll = getSetting("allow_all", "false") === "true";
-    if (!allowAll && !isAllowed(senderNumber)) return; // silently ignore
+    if (!allowAll && !isAllowed(senderNumber)) return;
 
-    // Office hours check
     if (!isOfficeHours()) return;
 
-    // Human-like delay
     await new Promise((r) => setTimeout(r, REPLY_DELAY_MS));
 
     try {

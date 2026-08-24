@@ -6,7 +6,7 @@ const qrcode = require("qrcode-terminal");
 
 const { handleAdmin } = require("./src/handlers/admin");
 const { handleCustomer } = require("./src/handlers/customer");
-const { isAllowed, getSetting } = require("./database/db");
+const { isAllowed, getSetting } = require("./src/database/db");
 
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || "").replace(/\D/g, "");
 const OFFICE_START_HOUR = Number(process.env.OFFICE_START_HOUR || 8);

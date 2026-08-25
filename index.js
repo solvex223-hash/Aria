@@ -37,6 +37,8 @@ async function startBot() {
   sock.ev.on("creds.update", saveCreds);
 
   if (!sock.authState.creds.registered) {
+    // Wait for the socket to actually finish connecting before requesting a code
+    await new Promise((resolve) => setTimeout(resolve, 3000));
     const phoneNumber = ADMIN_NUMBER;
     const code = await sock.requestPairingCode(phoneNumber);
     console.log("🔗 Your pairing code:", code);

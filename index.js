@@ -24,6 +24,8 @@ const SEND_KEY = process.env.ARIA_SEND_KEY || "";
 const AUTH_DIR = "./auth_info";
 const SHOW_QR = process.env.SHOW_QR === "true";
 const PAIRING_DELAY_MS = Number(process.env.PAIRING_DELAY_MS || 3000);
+// A new pairing code is requested this often until Aria is linked (default: every 60 seconds)
+const PAIRING_REFRESH_MS = Number(process.env.PAIRING_REFRESH_MS || 60000);
 const RELOGIN_DELAY_MS = Number(process.env.RELOGIN_DELAY_MS || 10000);
 const MAX_LOGOUT_RETRIES = 5;
 let logoutCount = 0;
@@ -32,6 +34,9 @@ let logoutCount = 0;
 // so /send always uses the current socket.
 let activeSock = null;
 let connected = false;
+
+// Stops the pairing-code loop that is currently running (if any)
+let stopCurrentPairing = null;
 
 function normalizeNumber(n) {
   return n.replace(/\D/g, "");
@@ -167,27 +172,70 @@ function startHttpServer() {
 // WhatsApp login helpers
 // ---------------------------------------------------------------------------
 
-// Asks WhatsApp for a pairing code and prints it clearly in the logs. Retries a few times.
-async function requestPairing(sock) {
+function stopPairing() {
+  if (stopCurrentPairing) {
+    stopCurrentPairing();
+    stopCurrentPairing = null;
+  }
+}
+
+// Prints a fresh pairing code every PAIRING_REFRESH_MS until Aria is linked.
+// Each new code replaces the previous one, so always use the newest code in the logs.
+function startPairing(sock) {
+  stopPairing();
+
   if (!ADMIN_NUMBER) {
     console.error(
       "❌ ADMIN_NUMBER is not set. Add it in Render's Environment tab (digits only, with country code, e.g. 2348012345678)."
     );
     return;
   }
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      // Give the socket a moment to finish connecting before requesting a code
-      await new Promise((resolve) => setTimeout(resolve, PAIRING_DELAY_MS));
-      const code = await sock.requestPairingCode(ADMIN_NUMBER);
-      console.log("🔗 YOUR PAIRING CODE:", code);
-      console.log("On your phone: WhatsApp > Settings > Linked Devices > Link a Device > Link with phone number instead");
-      return;
-    } catch (err) {
-      console.error(`❌ Pairing code request failed (attempt ${attempt}/3):`, err.message);
-    }
+
+  console.log(`📞 Pairing codes will be generated for: +${ADMIN_NUMBER}`);
+  console.log("   This must be the WhatsApp number of the phone you are linking.");
+  if (ADMIN_NUMBER.startsWith("0") || ADMIN_NUMBER.length < 11) {
+    console.warn(
+      "⚠️ ADMIN_NUMBER looks wrong. Use the full international format with no + or leading 0, e.g. 2348012345678. A wrong number causes 'incorrect phone number' on the phone."
+    );
   }
-  console.error("❌ Could not get a pairing code. Redeploy or restart the service to try again.");
+
+  let stopped = false;
+  let timeout = null;
+  let interval = null;
+  let attempt = 0;
+
+  const stop = () => {
+    stopped = true;
+    clearTimeout(timeout);
+    clearInterval(interval);
+  };
+  stopCurrentPairing = stop;
+
+  const issueCode = async () => {
+    if (stopped) return;
+    // Stop once linked, connected, or replaced by a newer socket
+    if (sock !== activeSock || connected || sock.authState.creds.registered) {
+      stop();
+      return;
+    }
+    attempt += 1;
+    try {
+      const code = await sock.requestPairingCode(ADMIN_NUMBER);
+      console.log(`🔗 PAIRING CODE #${attempt} for +${ADMIN_NUMBER}: ${code}`);
+      console.log(
+        "   On your phone: WhatsApp > Settings > Linked Devices > Link a Device > Link with phone number instead"
+      );
+      console.log(`   A new code will be printed in ${Math.round(PAIRING_REFRESH_MS / 1000)}s if this one isn't used.`);
+    } catch (err) {
+      console.error(`❌ Pairing code request #${attempt} failed:`, err.message);
+    }
+  };
+
+  // First code after a short delay so the socket can finish connecting, then repeat
+  timeout = setTimeout(() => {
+    issueCode();
+    if (!stopped) interval = setInterval(issueCode, PAIRING_REFRESH_MS);
+  }, PAIRING_DELAY_MS);
 }
 
 // WhatsApp logged Aria out (for example the linked device was removed). The saved login is now
@@ -219,6 +267,8 @@ function handleLoggedOut() {
 // ---------------------------------------------------------------------------
 
 async function startBot() {
+  stopPairing();
+
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const sock = makeWASocket({ auth: state });
   activeSock = sock;
@@ -235,6 +285,7 @@ async function startBot() {
 
     if (connection === "close") {
       connected = false;
+      stopPairing();
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
       if (statusCode !== DisconnectReason.loggedOut) {
         console.log("Connection closed. Reconnecting: true");
@@ -245,6 +296,7 @@ async function startBot() {
     } else if (connection === "open") {
       connected = true;
       logoutCount = 0;
+      stopPairing();
       console.log("✅ Aria is connected and online.");
     }
   });
@@ -303,9 +355,10 @@ async function startBot() {
     }
   });
 
-  // Not linked yet: ask for a pairing code (runs in the background so the handlers above stay active)
+  // Not linked yet: keep printing a fresh pairing code until the phone is linked
+  // (runs in the background so the handlers above stay active)
   if (!sock.authState.creds.registered) {
-    requestPairing(sock);
+    startPairing(sock);
   }
 }
 

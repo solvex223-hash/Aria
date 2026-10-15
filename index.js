@@ -9,12 +9,10 @@ const qrcode = require("qrcode-terminal");
 
 const { handleAdmin } = require("./src/handlers/admin");
 const { handleCustomer } = require("./src/handlers/customer");
-const { isAllowed, getSetting } = require("./src/database/db");
+const { isAllowed, getSetting, isBlocked, removeAllowed } = require("./src/database/access");
 
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || "").replace(/\D/g, "");
-const OFFICE_START_HOUR = Number(process.env.OFFICE_START_HOUR || 8);
-const OFFICE_END_HOUR = Number(process.env.OFFICE_END_HOUR || 22);
-const REPLY_DELAY_MS = 3000;
+const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 3000);
 
 // Web server settings. Render sets PORT automatically.
 // ARIA_SEND_KEY is the shared secret the Solvex daily-report route sends in the x-api-key header.
@@ -57,12 +55,6 @@ function getRealSenderJid(key) {
     return key.remoteJidAlt;
   }
   return key.remoteJid;
-}
-function isOfficeHours() {
-  const lagosHour = new Date(
-    new Date().toLocaleString("en-US", { timeZone: "Africa/Lagos" })
-  ).getHours();
-  return lagosHour >= OFFICE_START_HOUR && lagosHour < OFFICE_END_HOUR;
 }
 
 // ---------------------------------------------------------------------------
@@ -286,17 +278,20 @@ async function startBot() {
       return handleAdmin(sock, sender, text);
     }
 
+    // Aria only talks one-to-one. Ignore groups, status updates and channels.
+    if (sender.endsWith("@g.us") || sender.endsWith("@broadcast") || sender.endsWith("@newsletter")) return;
+
     if (text.trim().toUpperCase() === "STOP") {
-      const { removeAllowed } = require("./src/database/db");
       removeAllowed(senderNumber);
       await sock.sendMessage(sender, { text: "You've been unsubscribed. Take care!" });
       return;
     }
 
+    // Numbers turned off with /off never get a reply, even in /all on mode
+    if (isBlocked(senderNumber)) return;
+
     const allowAll = getSetting("allow_all", "false") === "true";
     if (!allowAll && !isAllowed(senderNumber)) return;
-
-    if (!isOfficeHours()) return;
 
     await new Promise((r) => setTimeout(r, REPLY_DELAY_MS));
 

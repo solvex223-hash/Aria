@@ -39,6 +39,19 @@ function normalizeNumber(n) {
   return n.replace(/\D/g, "");
 }
 
+// "2348012345678:12@s.whatsapp.net" or "99887766@lid" -> digits only
+function jidNumber(jid) {
+  return String(jid || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+}
+
+// True when a chat is the admin's own "Message yourself" chat.
+function isOwnChat(sock, key) {
+  const chat = jidNumber(key.remoteJid);
+  const chatAlt = jidNumber(key.remoteJidAlt);
+  const own = [jidNumber(sock.user?.id), jidNumber(sock.user?.lid), ADMIN_NUMBER].filter(Boolean);
+  return own.includes(chat) || (chatAlt && own.includes(chatAlt));
+}
+
 function getRealSenderJid(key) {
   if (key.remoteJid?.endsWith("@lid") && key.remoteJidAlt) {
     return key.remoteJidAlt;
@@ -244,13 +257,29 @@ async function startBot() {
     }
   });
 
-  sock.ev.on("messages.upsert", async ({ messages }) => {
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
     const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+    if (!msg.message) return;
 
     const sender = getRealSenderJid(msg.key);
     const senderNumber = normalizeNumber(sender.split("@")[0]);
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+
+    if (msg.key.fromMe) {
+      // Aria runs on the admin's own number, so the "Message yourself" chat is where the admin
+      // types commands. Only live messages typed by the admin count ("notify"). Aria's own replies
+      // and the daily reports arrive as "append", so they can never trigger a command loop.
+      if (text.trim().startsWith("/") && isOwnChat(sock, msg.key)) {
+        if (type !== "notify") {
+          console.log(`Ignoring self-chat command (message type: ${type})`);
+          return;
+        }
+        console.log("🛠 Admin command from self-chat:", text.trim().split(/\s+/)[0]);
+        return handleAdmin(sock, msg.key.remoteJid, text);
+      }
+      return;
+    }
+
     if (!text) return;
 
     if (senderNumber === ADMIN_NUMBER && text.trim().startsWith("/")) {

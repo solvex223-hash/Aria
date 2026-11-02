@@ -6,7 +6,10 @@ const memory = require("../services/memoryService");
 const notification = require("../services/notificationService");
 const { isBotEnabled } = require("../utils/botState");
 
-async function handleCustomer(sock, sender, text) {
+async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
+    const { isGroup = false, groupJid = null, quotedMsg = null } = options;
+    const conversationKey = isGroup ? groupJid : sender;
+
     try {
 
         // If admin has turned Aria off, don't reply to customers at all
@@ -15,11 +18,22 @@ async function handleCustomer(sock, sender, text) {
             return;
         }
 
-        // Save customer's message
-        await memory.saveMessage(sender, "user", text);
+        // If the transcript/message is genuinely empty, use fallback
+        if (!text || !text.trim()) {
+            const fallback = "I'm sorry, I didn't catch that. Could you please send it again? 😊";
+            if (isGroup && quotedMsg) {
+                await sock.sendMessage(conversationKey, { text: fallback, quoted: quotedMsg });
+            } else {
+                await sendMessage(sock, conversationKey, fallback);
+            }
+            return;
+        }
 
-        // Load conversation history
-        const history = await memory.getConversation(sender);
+        // Save customer's message
+        await memory.saveMessage(conversationKey, "user", text);
+
+        // Load conversation history (per group or per private chat)
+        const history = await memory.getConversation(conversationKey);
 
         const messages = history.map(item => ({
             role: item.role,
@@ -40,43 +54,58 @@ async function handleCustomer(sock, sender, text) {
         ai.sender = sender;
 
         console.log("🤖 Intent:", ai.intent);
-        console.log("🔥 Lead Score:", ai.leadScore);
 
         // ===============================
-        // NOTIFICATIONS
+        // NOTIFICATIONS (private chats only)
         // ===============================
+        if (!isGroup) {
+            console.log("🔥 Lead Score:", ai.leadScore);
 
-        // Notify on Hot Lead
-        if (ai.leadScore >= 80) {
-            await notification.notifyLead(sock, ai);
-        }
+            // Notify on Hot Lead
+            if (ai.leadScore >= 80) {
+                await notification.notifyLead(sock, ai);
+            }
 
-        // Notify when AI requests human assistance
-        if (ai.needsHuman) {
-            await notification.notifyHandoff(sock, ai);
-        }
+            // Notify when AI requests human assistance
+            if (ai.needsHuman) {
+                await notification.notifyHandoff(sock, ai);
+            }
 
-        // Notify when customer wants an appointment
-        if (ai.appointmentRequested) {
-            await notification.notifyAppointment(sock, ai);
+            // Notify when customer wants an appointment
+            if (ai.appointmentRequested) {
+                await notification.notifyAppointment(sock, ai);
+            }
         }
 
         // Save AI reply
         await memory.saveMessage(
-            sender,
+            conversationKey,
             "assistant",
             ai.reply
         );
 
-        // Reply to customer
-        await sendMessage(
-            sock,
-            sender,
-            ai.reply
-        );
+        // Reply to customer (quote in groups)
+        if (isGroup && quotedMsg) {
+            await sock.sendMessage(conversationKey, { text: ai.reply, quoted: quotedMsg });
+        } else {
+            await sendMessage(
+                sock,
+                conversationKey,
+                ai.reply
+            );
+        }
 
     } catch (err) {
-        console.error("❌ Customer Handler Error:", err);
+        // Log the real error with full details (model is logged inside askGroq)
+        console.error("❌ Customer Handler Error:", err.message);
+
+        // Only send fallback if we haven't already sent a response
+        const fallback = "I'm sorry, something went wrong. Please try again in a moment 😊";
+        if (isGroup && quotedMsg) {
+            await sock.sendMessage(conversationKey, { text: fallback, quoted: quotedMsg });
+        } else {
+            await sendMessage(sock, conversationKey, fallback);
+        }
     }
 }
 

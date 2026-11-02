@@ -3,16 +3,42 @@ const fs = require("fs");
 const http = require("http");
 const crypto = require("crypto");
 const baileys = require("@whiskeysockets/baileys");
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = baileys;
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadMediaMessage,
+} = baileys;
 const { Boom } = require("@hapi/boom");
 const qrcode = require("qrcode-terminal");
 
 const { handleAdmin } = require("./src/handlers/admin");
 const { handleCustomer } = require("./src/handlers/customer");
 const { isAllowed, getSetting, isBlocked, removeAllowed } = require("./src/database/access");
+const { isGroup, shouldReplyInGroup, handleGroupCommand, GROUP_HELP } = require("./groupControl");
+
+// Voice note and image helpers. If a file path is wrong, Aria still starts
+// and tells you which feature is switched off and why.
+let transcribeAudio = null;
+let describeImage = null;
+try {
+  transcribeAudio = require("./src/ai/transcribe");
+} catch (err) {
+  console.warn("⚠️ Voice notes are OFF: could not load ./src/ai/transcribe.js -", err.message);
+}
+try {
+  describeImage = require("./src/ai/vision");
+} catch (err) {
+  console.warn("⚠️ Images are OFF: could not load ./src/ai/vision.js -", err.message);
+}
 
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || "").replace(/\D/g, "");
 const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 3000);
+
+const VOICE_FAIL_REPLY =
+  "Sorry, I couldn't hear that voice note properly. Could you send it again or type it out?";
+const IMAGE_FAIL_REPLY =
+  "Sorry, I couldn't open that picture. Could you send it again or tell me what's in it?";
 
 // Web server settings. Render sets PORT automatically.
 // ARIA_SEND_KEY is the shared secret the Solvex daily-report route sends in the x-api-key header.
@@ -38,6 +64,24 @@ let connected = false;
 // Stops the pairing-code loop that is currently running (if any)
 let stopCurrentPairing = null;
 
+// A logger that prints nothing, needed by Baileys' media download
+const silentLogger = {
+  level: "silent",
+  child() {
+    return silentLogger;
+  },
+  trace() {},
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+  fatal() {},
+};
+
+function sleep(ms) {
+  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+}
+
 function normalizeNumber(n) {
   return n.replace(/\D/g, "");
 }
@@ -60,6 +104,62 @@ function getRealSenderJid(key) {
     return key.remoteJidAlt;
   }
   return key.remoteJid;
+}
+
+// Unwraps messages inside disappearing-message / view-once wrappers
+function normalizeContent(message) {
+  try {
+    return (baileys.normalizeMessageContent && baileys.normalizeMessageContent(message)) || message;
+  } catch {
+    return message;
+  }
+}
+
+// Shows "typing..." to the customer. A nicety, so it must never break a reply.
+async function setTyping(sock, jid, on) {
+  try {
+    await sock.sendPresenceUpdate(on ? "composing" : "paused", jid);
+  } catch {
+    // ignore
+  }
+}
+
+function downloadMedia(msg, sock) {
+  return downloadMediaMessage(msg, "buffer", {}, {
+    logger: silentLogger,
+    reuploadRequest: sock.updateMediaMessage,
+  });
+}
+
+// Voice note -> text. Returns "" if anything goes wrong.
+async function voiceNoteToText(msg, sock, audio) {
+  if (!transcribeAudio) return "";
+  try {
+    const buffer = await downloadMedia(msg, sock);
+    const transcript = await transcribeAudio(buffer, audio.mimetype || "audio/ogg");
+    console.log(`🎙️ Voice note transcribed: "${transcript}"`);
+    return transcript;
+  } catch (err) {
+    console.error("❌ Voice note failed:", err.message);
+    return "";
+  }
+}
+
+// Picture -> text for Aria to read. Returns "" if anything goes wrong.
+async function imageToText(msg, sock, image) {
+  if (!describeImage) return "";
+  try {
+    const buffer = await downloadMedia(msg, sock);
+    const caption = (image.caption || "").trim();
+    const description = await describeImage(buffer, caption, image.mimetype || "image/jpeg");
+    console.log("🖼️ Image described");
+    return caption
+      ? `${caption}\n\n[The customer attached a picture. What it shows: ${description}]`
+      : `[The customer sent a picture. What it shows: ${description}]`;
+  } catch (err) {
+    console.error("❌ Image failed:", err.message);
+    return "";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,9 +405,19 @@ async function startBot() {
     const msg = messages[0];
     if (!msg.message) return;
 
-    const sender = getRealSenderJid(msg.key);
+    const isGroupChat = isGroup(msg.key.remoteJid);
+    const remoteJid = msg.key.remoteJid;
+
+    // For groups, the actual sender is participant; for private chats it's the remoteJid
+    const participant = msg.key.participant || remoteJid;
+    const sender = getRealSenderJid({ remoteJid: participant });
     const senderNumber = normalizeNumber(sender.split("@")[0]);
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+    const content = normalizeContent(msg.message);
+    const text = content.conversation || content.extendedTextMessage?.text || "";
+
+    // Admin check: fromMe in self-chat (private) OR sender is admin number
+    const isAdminSender = senderNumber === ADMIN_NUMBER;
+    const isSelfChatFromMe = msg.key.fromMe && isOwnChat(sock, msg.key);
 
     if (msg.key.fromMe) {
       // Aria runs on the admin's own number, so the "Message yourself" chat is where the admin
@@ -319,39 +429,157 @@ async function startBot() {
           return;
         }
         console.log("🛠 Admin command from self-chat:", text.trim().split(/\s+/)[0]);
+        // Group commands (/groups, /group on|off|mode ...) typed in the self-chat
+        const groupReply = await handleGroupCommand(sock, msg, text, true);
+        if (groupReply) {
+          await sock.sendMessage(msg.key.remoteJid, { text: groupReply });
+          return;
+        }
         return handleAdmin(sock, msg.key.remoteJid, text);
       }
       return;
     }
 
-    if (!text) return;
+    // Only answer live messages. Old chats synced after linking arrive as "append"
+    // and must never get a reply.
+    if (type !== "notify") return;
 
-    if (senderNumber === ADMIN_NUMBER && text.trim().startsWith("/")) {
-      return handleAdmin(sock, sender, text);
-    }
+    const audio = content.audioMessage;
+    const image = content.imageMessage;
 
-    // Aria only talks one-to-one. Ignore groups, status updates and channels.
-    if (sender.endsWith("@g.us") || sender.endsWith("@broadcast") || sender.endsWith("@newsletter")) return;
+    // Nothing Aria can read (stickers, videos, documents and so on)
+    if (!text && !audio && !image) return;
 
-    if (text.trim().toUpperCase() === "STOP") {
-      removeAllowed(senderNumber);
-      await sock.sendMessage(sender, { text: "You've been unsubscribed. Take care!" });
+    // ===== PRIVATE CHATS =====
+    if (!isGroupChat) {
+      // Admin in private chat = admin number OR self-chat (Message yourself)
+      const isAdminPrivate = isAdminSender || isSelfChatFromMe;
+
+      // Check for group control commands from admin in private chat
+      if (isAdminPrivate) {
+        const groupReply = await handleGroupCommand(sock, msg, text, true);
+        if (groupReply) {
+          await sock.sendMessage(remoteJid, { text: groupReply });
+          return;
+        }
+      }
+
+      // Admin commands in private chat (only from admin)
+      if (isAdminPrivate && text.trim().startsWith("/")) {
+        return handleAdmin(sock, sender, text);
+      }
+
+      // Ignore broadcasts/channels
+      if (sender.endsWith("@broadcast") || sender.endsWith("@newsletter")) return;
+
+      if (text.trim().toUpperCase() === "STOP") {
+        removeAllowed(senderNumber);
+        await sock.sendMessage(sender, { text: "You've been unsubscribed. Take care!" });
+        return;
+      }
+
+      // Numbers turned off with /off never get a reply, even in /all on mode
+      if (isBlocked(senderNumber)) return;
+
+      const allowAll = getSetting("allow_all", "false") === "true";
+      if (!allowAll && !isAllowed(senderNumber)) return;
+
+      const startedAt = Date.now();
+      await setTyping(sock, sender, true);
+
+      try {
+        let customerText = text;
+
+        // Voice notes and pictures are only processed for people Aria is allowed to answer
+        if (audio) {
+          customerText = await voiceNoteToText(msg, sock, audio);
+          if (!customerText) {
+            await sock.sendMessage(sender, { text: VOICE_FAIL_REPLY });
+            return;
+          }
+        } else if (image) {
+          customerText = await imageToText(msg, sock, image);
+          if (!customerText) {
+            await sock.sendMessage(sender, { text: IMAGE_FAIL_REPLY });
+            return;
+          }
+        }
+
+        // Human-like pause. Time already spent on a voice note or picture counts toward it.
+        await sleep(REPLY_DELAY_MS - (Date.now() - startedAt));
+
+        await handleCustomer(sock, sender, senderNumber, customerText);
+      } catch (err) {
+        console.error("Error handling customer message:", err);
+        await sock.sendMessage(sender, { text: "Sorry, I'm having trouble right now. Please try again shortly." });
+      } finally {
+        await setTyping(sock, sender, false);
+      }
       return;
     }
 
-    // Numbers turned off with /off never get a reply, even in /all on mode
-    if (isBlocked(senderNumber)) return;
+    // ===== GROUP CHATS =====
+    // Check if we should reply in this group
+    const botIds = [sock.user?.id, sock.user?.lid];
+    if (!shouldReplyInGroup(msg, botIds)) {
+      return; // silently ignore
+    }
 
-    const allowAll = getSetting("allow_all", "false") === "true";
-    if (!allowAll && !isAllowed(senderNumber)) return;
+    // Log group JID and mentionedJid for debugging
+    const m = msg.message || {};
+    const ctx = m.extendedTextMessage?.contextInfo || m.imageMessage?.contextInfo || m.audioMessage?.contextInfo || m.videoMessage?.contextInfo || {};
+    const mentioned = (ctx.mentionedJid || []).map(j => j.split("@")[0]).join(",");
+    console.log(`👥 Group: ${remoteJid} | mentions: [${mentioned}]`);
 
-    await new Promise((r) => setTimeout(r, REPLY_DELAY_MS));
+    // Strip bot's own @mention from text
+    let cleanText = text;
+    const botIdClean = (sock.user?.id || "").split(":")[0].split("@")[0];
+    const botLidClean = (sock.user?.lid || "").split(":")[0].split("@")[0];
+    const mentionPatterns = [
+      new RegExp(`@${botIdClean}\\b`),
+      new RegExp(`@${botLidClean}\\b`),
+      /@\d+/g
+    ];
+    for (const pattern of mentionPatterns) {
+      cleanText = cleanText.replace(pattern, "").trim();
+    }
+
+    const startedAt = Date.now();
+    await setTyping(sock, remoteJid, true);
 
     try {
-      await handleCustomer(sock, sender, senderNumber, text);
+      let customerText = cleanText;
+
+      // Voice notes and pictures are processed for allowed groups
+      if (audio) {
+        customerText = await voiceNoteToText(msg, sock, audio);
+        if (!customerText) {
+          await sock.sendMessage(remoteJid, { text: VOICE_FAIL_REPLY, quoted: msg });
+          return;
+        }
+      } else if (image) {
+        customerText = await imageToText(msg, sock, image);
+        if (!customerText) {
+          await sock.sendMessage(remoteJid, { text: IMAGE_FAIL_REPLY, quoted: msg });
+          return;
+        }
+      }
+
+      // Human-like pause. Time already spent on a voice note or picture counts toward it.
+      await sleep(REPLY_DELAY_MS - (Date.now() - startedAt));
+
+      // In groups: use group JID as conversation key, don't do lead scoring/saving as lead
+      // Pass isGroup flag to handleCustomer
+      await handleCustomer(sock, remoteJid, senderNumber, customerText, {
+        isGroup: true,
+        groupJid: remoteJid,
+        quotedMsg: msg
+      });
     } catch (err) {
-      console.error("Error handling customer message:", err);
-      await sock.sendMessage(sender, { text: "Sorry, I'm having trouble right now. Please try again shortly." });
+      console.error("Error handling group message:", err);
+      await sock.sendMessage(remoteJid, { text: "Sorry, I'm having trouble right now. Please try again shortly.", quoted: msg });
+    } finally {
+      await setTyping(sock, remoteJid, false);
     }
   });
 

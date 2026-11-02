@@ -18,6 +18,7 @@ const {
   removeBlocked,
   listBlocked,
 } = require("../database/access");
+const { GROUP_HELP } = require("../../groupControl");
 
 // "0803 123 4567", "+234 803 123 4567", "2348031234567" -> "2348031234567"
 function normalizePhone(input) {
@@ -40,7 +41,7 @@ const HELP_TEXT = [
   "/help - this list",
   "",
   "Number example: 08012345678 or 2348012345678",
-].join("\n");
+].join("\n") + "\n\n" + GROUP_HELP;
 
 async function handleAdmin(sock, sender, text) {
   const reply = (t) => sock.sendMessage(sender, { text: t });

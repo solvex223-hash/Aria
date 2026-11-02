@@ -5,17 +5,22 @@ const crypto = require("crypto");
 const baileys = require("@whiskeysockets/baileys");
 const {
   default: makeWASocket,
-  useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  Browsers,
 } = baileys;
-const { Boom } = require("@hapi/boom");
+const pino = require("pino");
 const qrcode = require("qrcode-terminal");
+
+const { openAuthStore, clearAuthStore, describeAuthStore } = require("./src/whatsapp/authStore");
 
 const { handleAdmin } = require("./src/handlers/admin");
 const { handleCustomer } = require("./src/handlers/customer");
 const { isAllowed, getSetting, isBlocked, removeAllowed } = require("./src/database/access");
 const { isGroup, shouldReplyInGroup, handleGroupCommand, GROUP_HELP } = require("./groupControl");
+const { setTyping, markRead, readPause } = require("./src/whatsapp/typing");
 
 // Voice note and image helpers. If a file path is wrong, Aria still starts
 // and tells you which feature is switched off and why.
@@ -33,7 +38,28 @@ try {
 }
 
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || "").replace(/\D/g, "");
-const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || 3000);
+// Human-like behaviour (blue ticks, "typing...", a short pause) lives in ./src/whatsapp/typing.js.
+// Turn it off with SHOW_TYPING=false or MARK_READ=false.
+// Answer everyone who messages (except numbers turned off with /off). Set REPLY_TO_ALL=false
+// to go back to answering only numbers turned on with /on. A /all on or /all off typed by the
+// admin still wins over this default.
+const REPLY_TO_ALL = !["false", "0", "no", "off"].includes(String(process.env.REPLY_TO_ALL ?? "true").trim().toLowerCase());
+// Safety brake: at most this many replies per chat per minute, so Aria can never get stuck in
+// a loop with another bot (and WhatsApp doesn't flag the number).
+const DEBUG_MESSAGES = String(process.env.DEBUG_MESSAGES ?? "true").trim().toLowerCase() !== "false";
+const MAX_REPLIES_PER_MIN = Number(process.env.MAX_REPLIES_PER_MIN || 8);
+const replyLog = new Map();
+function overRateLimit(jid) {
+  const now = Date.now();
+  const recent = (replyLog.get(jid) || []).filter((t) => now - t < 60000);
+  if (recent.length >= MAX_REPLIES_PER_MIN) {
+    replyLog.set(jid, recent);
+    return true;
+  }
+  recent.push(now);
+  replyLog.set(jid, recent);
+  return false;
+}
 
 const VOICE_FAIL_REPLY =
   "Sorry, I couldn't hear that voice note properly. Could you send it again or type it out?";
@@ -47,22 +73,33 @@ const SEND_KEY = process.env.ARIA_SEND_KEY || "";
 
 // Login handling.
 // By default Aria links with a pairing code (no QR in the logs). Set SHOW_QR=true to print the QR too.
-const AUTH_DIR = "./auth_info";
-const SHOW_QR = process.env.SHOW_QR === "true";
-const PAIRING_DELAY_MS = Number(process.env.PAIRING_DELAY_MS || 3000);
-// A new pairing code is requested this often until Aria is linked (default: every 60 seconds)
-const PAIRING_REFRESH_MS = Number(process.env.PAIRING_REFRESH_MS || 60000);
-const RELOGIN_DELAY_MS = Number(process.env.RELOGIN_DELAY_MS || 10000);
-const MAX_LOGOUT_RETRIES = 5;
-let logoutCount = 0;
+// Where the login is saved (files or Supabase) is decided in ./src/whatsapp/authStore.js
+// QR mode: run "node index.js --qr" (or set SHOW_QR=true)
+const SHOW_QR =
+  process.argv.includes("--qr") ||
+  ["true", "1", "yes", "on"].includes(String(process.env.SHOW_QR || "").trim().toLowerCase());
+// If WhatsApp never signals that it is ready, ask for the pairing code anyway after this long
+const PAIRING_FALLBACK_MS = Number(process.env.PAIRING_FALLBACK_MS || 8000);
+// Pause before starting a clean pairing round
+const RELOGIN_DELAY_MS = Number(process.env.RELOGIN_DELAY_MS || 4000);
+// Stop asking for pairing codes after this many tries, so WhatsApp doesn't flag the number
+const MAX_PAIRING_ROUNDS = Number(process.env.MAX_PAIRING_ROUNDS || 6);
+// Baileys log level: "warn" keeps the logs readable. Use "info" or "debug" when hunting a bug.
+const VALID_LOG_LEVELS = ["fatal", "error", "warn", "info", "debug", "trace", "silent"];
+const requestedLogLevel = String(process.env.LOG_LEVEL || "warn").trim().toLowerCase();
+const LOG_LEVEL = VALID_LOG_LEVELS.includes(requestedLogLevel) ? requestedLogLevel : "warn";
+const baileysLogger = pino({ level: LOG_LEVEL });
 
 // The live WhatsApp connection. startBot() replaces this every time Aria reconnects,
 // so /send always uses the current socket.
 let activeSock = null;
 let connected = false;
 
-// Stops the pairing-code loop that is currently running (if any)
-let stopCurrentPairing = null;
+// Every new socket gets a new number. Events from an older socket are ignored.
+let generation = 0;
+let restartTimer = null;
+let failStreak = 0; // failed connects in a row, used for back-off
+let pairingRounds = 0; // pairing codes issued since Aria was last online
 
 // A logger that prints nothing, needed by Baileys' media download
 const silentLogger = {
@@ -99,11 +136,30 @@ function isOwnChat(sock, key) {
   return own.includes(chat) || (chatAlt && own.includes(chatAlt));
 }
 
-function getRealSenderJid(key) {
-  if (key.remoteJid?.endsWith("@lid") && key.remoteJidAlt) {
-    return key.remoteJidAlt;
+// Finds the real phone number of whoever sent a message.
+// New WhatsApp accounts hide the phone number behind an id ending in "@lid". The real number
+// comes in remoteJidAlt (private chats) or participantAlt (groups). Without this, /off and /on
+// never matched, because they store phone numbers but the bot was comparing the hidden id.
+async function resolveSenderNumber(sock, key, isGroupChat) {
+  const primary = (isGroupChat ? key.participant : key.remoteJid) || key.remoteJid || "";
+  const alt = isGroupChat ? key.participantAlt : key.remoteJidAlt;
+  let jid = primary;
+  if (jid.endsWith("@lid")) {
+    if (alt && alt.endsWith("@s.whatsapp.net")) {
+      jid = alt;
+    } else {
+      try {
+        const pn = await sock.signalRepository?.lidMapping?.getPNForLID(jid);
+        if (pn) jid = pn;
+      } catch {
+        // fall through
+      }
+      if (jid.endsWith("@lid")) {
+        console.warn(`⚠️ Could not find the phone number behind ${jid}. /on and /off cannot match this sender.`);
+      }
+    }
   }
-  return key.remoteJid;
+  return jidNumber(jid);
 }
 
 // Unwraps messages inside disappearing-message / view-once wrappers
@@ -112,15 +168,6 @@ function normalizeContent(message) {
     return (baileys.normalizeMessageContent && baileys.normalizeMessageContent(message)) || message;
   } catch {
     return message;
-  }
-}
-
-// Shows "typing..." to the customer. A nicety, so it must never break a reply.
-async function setTyping(sock, jid, on) {
-  try {
-    await sock.sendPresenceUpdate(on ? "composing" : "paused", jid);
-  } catch {
-    // ignore
   }
 }
 
@@ -269,97 +316,77 @@ function startHttpServer() {
 }
 
 // ---------------------------------------------------------------------------
-// WhatsApp login helpers
+// WhatsApp login + connection handling
 // ---------------------------------------------------------------------------
 
-function stopPairing() {
-  if (stopCurrentPairing) {
-    stopCurrentPairing();
-    stopCurrentPairing = null;
-  }
+function nextBackoffMs() {
+  failStreak += 1;
+  return Math.min(5000 * 2 ** (failStreak - 1), 60000); // 5s, 10s, 20s, 40s, then 60s
 }
 
-// Prints a fresh pairing code every PAIRING_REFRESH_MS until Aria is linked.
-// Each new code replaces the previous one, so always use the newest code in the logs.
-function startPairing(sock) {
-  stopPairing();
-
-  if (!ADMIN_NUMBER) {
-    console.error(
-      "❌ ADMIN_NUMBER is not set. Add it in Render's Environment tab (digits only, with country code, e.g. 2348012345678)."
-    );
-    return;
-  }
-
-  console.log(`📞 Pairing codes will be generated for: +${ADMIN_NUMBER}`);
-  console.log("   This must be the WhatsApp number of the phone you are linking.");
-  if (ADMIN_NUMBER.startsWith("0") || ADMIN_NUMBER.length < 11) {
-    console.warn(
-      "⚠️ ADMIN_NUMBER looks wrong. Use the full international format with no + or leading 0, e.g. 2348012345678. A wrong number causes 'incorrect phone number' on the phone."
-    );
-  }
-
-  let stopped = false;
-  let timeout = null;
-  let interval = null;
-  let attempt = 0;
-
-  const stop = () => {
-    stopped = true;
-    clearTimeout(timeout);
-    clearInterval(interval);
-  };
-  stopCurrentPairing = stop;
-
-  const issueCode = async () => {
-    if (stopped) return;
-    // Stop once linked, connected, or replaced by a newer socket
-    if (sock !== activeSock || connected || sock.authState.creds.registered) {
-      stop();
-      return;
-    }
-    attempt += 1;
-    try {
-      const code = await sock.requestPairingCode(ADMIN_NUMBER);
-      console.log(`🔗 PAIRING CODE #${attempt} for +${ADMIN_NUMBER}: ${code}`);
-      console.log(
-        "   On your phone: WhatsApp > Settings > Linked Devices > Link a Device > Link with phone number instead"
-      );
-      console.log(`   A new code will be printed in ${Math.round(PAIRING_REFRESH_MS / 1000)}s if this one isn't used.`);
-    } catch (err) {
-      console.error(`❌ Pairing code request #${attempt} failed:`, err.message);
-    }
-  };
-
-  // First code after a short delay so the socket can finish connecting, then repeat
-  timeout = setTimeout(() => {
-    issueCode();
-    if (!stopped) interval = setInterval(issueCode, PAIRING_REFRESH_MS);
-  }, PAIRING_DELAY_MS);
+function scheduleStart(delayMs, why) {
+  clearTimeout(restartTimer);
+  console.log(`⏳ Starting a new WhatsApp connection in ${Math.round(delayMs / 1000)}s (${why})`);
+  restartTimer = setTimeout(() => {
+    startBot().catch((err) => {
+      console.error("❌ Could not start the WhatsApp connection:", err.message);
+      scheduleStart(nextBackoffMs(), "start failed");
+    });
+  }, delayMs);
 }
 
-// WhatsApp logged Aria out (for example the linked device was removed). The saved login is now
-// useless, so clear it and start fresh. That makes Aria ask for a new pairing code instead of
-// crashing and looping with a dead login.
-function handleLoggedOut() {
-  logoutCount += 1;
-  if (logoutCount > MAX_LOGOUT_RETRIES) {
-    console.error(
-      "❌ Logged out too many times in a row. Stopping retries. Check WhatsApp > Linked Devices, then redeploy."
-    );
-    return;
-  }
-  console.log(
-    `Logged out of WhatsApp (${logoutCount}/${MAX_LOGOUT_RETRIES}). Clearing the saved login and requesting a new pairing code...`
-  );
+// Wipes the saved login and starts a clean pairing round
+async function resetLoginAndRelink(why) {
+  console.log(`🧹 ${why}. Clearing the saved login and starting fresh...`);
   try {
-    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    await clearAuthStore();
   } catch (err) {
-    console.error("Could not clear the saved login:", err.message);
+    console.error("❌ Could not clear the saved login:", err.message);
   }
-  setTimeout(() => {
-    startBot().catch((err) => console.error("Restart after logout failed:", err));
-  }, RELOGIN_DELAY_MS);
+  scheduleStart(RELOGIN_DELAY_MS, "fresh login");
+}
+
+// Gets the newest WhatsApp Web version number. A version WhatsApp no longer accepts is the
+// most common reason for "Connection Failure" (code 405), so we never trust the built-in one alone.
+async function getWaVersion() {
+  try {
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    if (Array.isArray(version)) {
+      console.log(`ℹ️ WhatsApp Web version ${version.join(".")}${isLatest ? " (latest)" : " (built-in fallback)"}`);
+      return version;
+    }
+  } catch (err) {
+    console.warn("⚠️ Could not look up the latest WhatsApp version, using the built-in one:", err.message);
+  }
+  return undefined;
+}
+
+const CLOSE_HINTS = {
+  405: "WhatsApp rejected the app version. Update Baileys (npm install @whiskeysockets/baileys@latest) and restart.",
+  403: "WhatsApp refused this number for now (temporary restriction). Stop trying for a few hours.",
+  428: "The connection was closed by WhatsApp. Aria will try again.",
+  503: "WhatsApp is busy. Aria will try again.",
+};
+
+// Asks WhatsApp for ONE pairing code for this socket. Asking again would cancel the code
+// you are typing, which is what causes "couldn't connect" on the phone.
+async function requestCodeOnce(sock, myGen, pairing) {
+  if (pairing.requested || myGen !== generation) return;
+  pairing.requested = true;
+  clearTimeout(pairing.timer);
+  try {
+    const code = await sock.requestPairingCode(ADMIN_NUMBER);
+    if (myGen !== generation) return;
+    pairingRounds += 1;
+    const pretty = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+    console.log("");
+    console.log(`🔗 PAIRING CODE for +${ADMIN_NUMBER}:  ${pretty}   (try ${pairingRounds}/${MAX_PAIRING_ROUNDS})`);
+    console.log("   On your phone: WhatsApp > Settings > Linked Devices > Link a Device > Link with phone number instead");
+    console.log("   Type this code within about 2 minutes. If it expires, Aria prints a new one by itself.");
+    console.log("");
+  } catch (err) {
+    console.error("❌ Pairing code request failed:", err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,51 +394,192 @@ function handleLoggedOut() {
 // ---------------------------------------------------------------------------
 
 async function startBot() {
-  stopPairing();
+  const myGen = ++generation;
+  clearTimeout(restartTimer);
+  connected = false;
 
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const sock = makeWASocket({ auth: state });
+  // Close the previous socket quietly (it is normally closed already)
+  if (activeSock) {
+    try {
+      activeSock.end(undefined);
+    } catch {
+      // ignore
+    }
+  }
+
+  let store;
+  try {
+    store = await openAuthStore();
+  } catch (err) {
+    console.error("❌ Could not open the saved WhatsApp login:", err.message);
+    return scheduleStart(nextBackoffMs(), "login storage error");
+  }
+  if (myGen !== generation) return;
+
+  // A pairing attempt that never finished leaves a half-made login behind (a phone number but
+  // no account). Trying to log in with it makes WhatsApp answer 401, which used to send Aria
+  // into a wipe-and-retry loop. Clear it so pairing starts clean.
+  if (!store.state.creds.account && store.state.creds.me) {
+    console.log("🧹 Found a half-finished login from an earlier attempt. Clearing it so pairing starts clean.");
+    try {
+      await clearAuthStore();
+      store = await openAuthStore();
+    } catch (err) {
+      console.error("❌ Could not clear the half-finished login:", err.message);
+      return scheduleStart(nextBackoffMs(), "login storage error");
+    }
+    if (myGen !== generation) return;
+  }
+
+  // No account yet = this is a fresh link that needs a pairing code
+  const needsPairing = !store.state.creds.account;
+
+  if (needsPairing) {
+    if (!ADMIN_NUMBER) {
+      console.error(
+        "❌ ADMIN_NUMBER is not set. Add it (digits only, with country code, e.g. 2348012345678)."
+      );
+      return;
+    }
+    if (pairingRounds >= MAX_PAIRING_ROUNDS) {
+      console.error(
+        `❌ ${MAX_PAIRING_ROUNDS} pairing codes were issued and none was used. Stopping so WhatsApp doesn't flag the number.\n` +
+          "   Check WhatsApp > Linked Devices on the phone, then restart Aria and enter the code as soon as it prints."
+      );
+      return;
+    }
+    if (ADMIN_NUMBER.startsWith("0") || ADMIN_NUMBER.length < 11) {
+      console.warn(
+        "⚠️ ADMIN_NUMBER looks wrong. Use the full international format with no + or leading 0, e.g. 2348012345678."
+      );
+    }
+  }
+
+  const version = await getWaVersion();
+  if (myGen !== generation) return;
+
+  const sock = makeWASocket({
+    ...(version ? { version } : {}),
+    auth: {
+      creds: store.state.creds,
+      keys: makeCacheableSignalKeyStore(store.state.keys, baileysLogger),
+    },
+    logger: baileysLogger,
+    browser: Browsers.ubuntu("Chrome"),
+    markOnlineOnConnect: false, // keeps WhatsApp notifications working on your phone
+    syncFullHistory: false,
+  });
   activeSock = sock;
 
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("creds.update", () => {
+    if (myGen === generation) store.saveCreds();
+  });
+
+  const pairing = { requested: false, timer: null };
+  if (needsPairing) {
+    console.log(`📞 Linking WhatsApp number +${ADMIN_NUMBER}. This must be the number of the phone you are linking.`);
+    console.log(`💾 Login is saved in: ${describeAuthStore()}`);
+    if (SHOW_QR) {
+      console.log("📱 QR mode: no pairing code will be requested. Scan the QR below with WhatsApp > Linked Devices > Link a Device.");
+    } else {
+      // Normally the code is requested the moment WhatsApp says it is ready (the "qr" event below).
+      pairing.timer = setTimeout(() => requestCodeOnce(sock, myGen, pairing), PAIRING_FALLBACK_MS);
+    }
+  }
 
   sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    if (myGen !== generation) return;
+    const { connection, lastDisconnect, qr, isNewLogin } = update;
 
-    if (qr && SHOW_QR) {
-      console.log("📱 Scan this QR code with WhatsApp > Linked Devices > Link a Device:");
-      qrcode.generate(qr, { small: true });
+    if (qr) {
+      if (SHOW_QR) {
+        console.log("📱 Scan this QR code with WhatsApp > Linked Devices > Link a Device:");
+        qrcode.generate(qr, { small: true });
+      }
+      if (needsPairing && !SHOW_QR) requestCodeOnce(sock, myGen, pairing);
+    }
+
+    if (isNewLogin) {
+      console.log("🎉 Phone linked. WhatsApp will now restart the connection once (this is normal)...");
+    }
+
+    if (connection === "open") {
+      connected = true;
+      failStreak = 0;
+      pairingRounds = 0;
+      clearTimeout(pairing.timer);
+      console.log("✅ Aria is connected and online.");
+      return;
     }
 
     if (connection === "close") {
       connected = false;
-      stopPairing();
-      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      if (statusCode !== DisconnectReason.loggedOut) {
-        console.log("Connection closed. Reconnecting: true");
-        startBot().catch((err) => console.error("Reconnect failed:", err));
+      clearTimeout(pairing.timer);
+
+      const err = lastDisconnect?.error;
+      const statusCode = err?.output?.statusCode;
+      const reasonName = DisconnectReason[statusCode] || "unknown";
+      console.log(`🔌 Connection closed: ${err?.message || "no reason given"} (code ${statusCode ?? "none"}, ${reasonName})`);
+      if (CLOSE_HINTS[statusCode]) console.log(`   ${CLOSE_HINTS[statusCode]}`);
+
+      // 515: WhatsApp asks for a restart right after a successful link. Completely normal.
+      if (statusCode === DisconnectReason.restartRequired) {
+        failStreak = 0;
+        return scheduleStart(500, "restart requested by WhatsApp");
+      }
+
+      // 440: the same login is open somewhere else (for example Render AND your PC).
+      if (statusCode === DisconnectReason.connectionReplaced) {
+        console.error(
+          "❌ Another copy of Aria is using this same WhatsApp login (Render and your PC at the same time?).\n" +
+            "   Stop the other copy. This one will not reconnect, so the two don't fight."
+        );
         return;
       }
-      handleLoggedOut();
-    } else if (connection === "open") {
-      connected = true;
-      logoutCount = 0;
-      stopPairing();
-      console.log("✅ Aria is connected and online.");
+
+      // 401: WhatsApp says this login is no longer valid (device removed from Linked Devices)
+      if (statusCode === DisconnectReason.loggedOut) {
+        return resetLoginAndRelink("WhatsApp logged this device out");
+      }
+
+      // The pairing code expired or the link was never finished: start a clean round with a new code
+      if (needsPairing) {
+        return resetLoginAndRelink("The pairing code expired before the phone was linked");
+      }
+
+      // Anything else (network drop, timeout, WhatsApp busy): reconnect with the same login
+      return scheduleStart(nextBackoffMs(), `code ${statusCode ?? "none"}`);
     }
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (myGen !== generation) return;
     const msg = messages[0];
-    if (!msg.message) return;
+    // One short line per incoming message, so you can see in the logs whether a message even
+    // reached Aria. Turn off with DEBUG_MESSAGES=false.
+    if (DEBUG_MESSAGES) {
+      if (!msg) return;
+      const who = String(msg.key?.remoteJid || "").split("@")[0].slice(-6);
+      console.log(
+        msg.message
+          ? `📥 incoming (${type}) chat=...${who} fromMe=${Boolean(msg.key.fromMe)}`
+          : `📥 incoming (${type}) chat=...${who} but EMPTY (WhatsApp could not decrypt it, stub ${msg.messageStubType ?? "none"})`
+      );
+    }
+    if (!msg || !msg.message) return;
+
+    // Status updates, broadcast lists and channels are never chats. Without this, answering
+    // everyone would also reply to people's WhatsApp statuses.
+    const rj = msg.key.remoteJid || "";
+    if (rj === "status@broadcast" || rj.endsWith("@broadcast") || rj.endsWith("@newsletter")) return;
 
     const isGroupChat = isGroup(msg.key.remoteJid);
     const remoteJid = msg.key.remoteJid;
 
     // For groups, the actual sender is participant; for private chats it's the remoteJid
     const participant = msg.key.participant || remoteJid;
-    const sender = getRealSenderJid({ remoteJid: participant });
-    const senderNumber = normalizeNumber(sender.split("@")[0]);
+    const sender = participant; // where replies are sent
+    const senderNumber = await resolveSenderNumber(sock, msg.key, isGroupChat); // real phone number
     const content = normalizeContent(msg.message);
     const text = content.conversation || content.extendedTextMessage?.text || "";
 
@@ -447,8 +615,10 @@ async function startBot() {
     const audio = content.audioMessage;
     const image = content.imageMessage;
 
-    // Nothing Aria can read (stickers, videos, documents and so on)
-    if (!text && !audio && !image) return;
+    // Nothing Aria can read (stickers, reactions and so on). Videos and files in a private chat
+    // still get a short friendly note further down.
+    const isVideoOrFile = Boolean(content.videoMessage || content.documentMessage);
+    if (!text && !audio && !image && !isVideoOrFile) return;
 
     // ===== PRIVATE CHATS =====
     if (!isGroupChat) {
@@ -479,12 +649,33 @@ async function startBot() {
       }
 
       // Numbers turned off with /off never get a reply, even in /all on mode
-      if (isBlocked(senderNumber)) return;
+      if (isBlocked(senderNumber)) {
+        console.log(`🛑 Ignored +${senderNumber} (turned off with /off)`);
+        return;
+      }
 
-      const allowAll = getSetting("allow_all", "false") === "true";
-      if (!allowAll && !isAllowed(senderNumber)) return;
+      const allowAll = getSetting("allow_all", REPLY_TO_ALL ? "true" : "false") === "true";
+      if (!allowAll && !isAllowed(senderNumber)) {
+        console.log(`🔒 Ignored +${senderNumber} (not turned on with /on)`);
+        return;
+      }
 
-      const startedAt = Date.now();
+      if (overRateLimit(sender)) {
+        console.log(`⏱️ Too many replies to ${sender} in the last minute, skipping this one`);
+        return;
+      }
+
+      await markRead(sock, msg);
+
+      if (!text && !audio && !image) {
+        await sleep(readPause());
+        await sock.sendMessage(sender, {
+          text: "Got it 😊 I can't open videos or files yet. Send me a voice note, a picture, or just type what you need.",
+        });
+        return;
+      }
+
+      await sleep(readPause());
       await setTyping(sock, sender, true);
 
       try {
@@ -505,8 +696,6 @@ async function startBot() {
           }
         }
 
-        // Human-like pause. Time already spent on a voice note or picture counts toward it.
-        await sleep(REPLY_DELAY_MS - (Date.now() - startedAt));
 
         await handleCustomer(sock, sender, senderNumber, customerText);
       } catch (err) {
@@ -544,7 +733,14 @@ async function startBot() {
       cleanText = cleanText.replace(pattern, "").trim();
     }
 
-    const startedAt = Date.now();
+    if (!text && !audio && !image) return;
+    if (overRateLimit(remoteJid)) {
+      console.log(`⏱️ Too many replies in group ${remoteJid} in the last minute, skipping this one`);
+      return;
+    }
+
+    await markRead(sock, msg);
+    await sleep(readPause());
     await setTyping(sock, remoteJid, true);
 
     try {
@@ -565,8 +761,6 @@ async function startBot() {
         }
       }
 
-      // Human-like pause. Time already spent on a voice note or picture counts toward it.
-      await sleep(REPLY_DELAY_MS - (Date.now() - startedAt));
 
       // In groups: use group JID as conversation key, don't do lead scoring/saving as lead
       // Pass isGroup flag to handleCustomer
@@ -583,12 +777,19 @@ async function startBot() {
     }
   });
 
-  // Not linked yet: keep printing a fresh pairing code until the phone is linked
-  // (runs in the background so the handlers above stay active)
-  if (!sock.authState.creds.registered) {
-    startPairing(sock);
-  }
 }
 
+// A stray error must never take the whole bot down (Render would restart it and the
+// connection would drop). Log it and keep running.
+process.on("unhandledRejection", (err) => {
+  console.error("⚠️ Unhandled error:", err && err.message ? err.message : err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("⚠️ Uncaught error:", err && err.message ? err.message : err);
+});
+
 startHttpServer();
-startBot().catch((err) => console.error("Failed to start Aria:", err));
+startBot().catch((err) => {
+  console.error("❌ Failed to start Aria:", err.message);
+  scheduleStart(nextBackoffMs(), "start failed");
+});

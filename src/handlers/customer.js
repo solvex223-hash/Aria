@@ -5,6 +5,7 @@ const sendMessage = require("../whatsapp/sender");
 const memory = require("../services/memoryService");
 const notification = require("../services/notificationService");
 const { isBotEnabled } = require("../utils/botState");
+const { typingDelay } = require("../whatsapp/typing");
 
 async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
     const { isGroup = false, groupJid = null, quotedMsg = null } = options;
@@ -39,6 +40,9 @@ async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
             role: item.role,
             content: item.message
         }));
+
+        // Time spent thinking counts toward the "typing..." time, so replies feel human
+        const thinkStart = Date.now();
 
         // Ask Groq
         const raw = await askGroq(
@@ -83,6 +87,9 @@ async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
             "assistant",
             ai.reply
         );
+
+        // Keep "typing..." visible for about as long as a person would take to type this reply
+        await typingDelay(ai.reply, thinkStart);
 
         // Reply to customer (quote in groups)
         if (isGroup && quotedMsg) {

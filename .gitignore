@@ -8,6 +8,7 @@ node_modules/
 
 # WhatsApp session (never commit — contains live auth credentials)
 auth/
+auth_info/
 
 # Database and app settings (local state, not source code)
 data/

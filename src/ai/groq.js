@@ -22,6 +22,65 @@ function reasoningOptions(model) {
     return {};
 }
 
+
+// Sometimes the model answers in plain text instead of JSON (it happens most in casual chat, and
+// in Pidgin). Groq then rejects the answer with a 400 "json_validate_failed" error, but it still
+// includes the text the model wrote ("failed_generation"). Instead of telling the customer
+// "something went wrong", we rescue that text and use it as the reply.
+function failedGenerationFrom(err) {
+    const direct = [err?.error?.error?.failed_generation, err?.error?.failed_generation];
+    for (const c of direct) {
+        if (typeof c === "string" && c.trim()) return c;
+    }
+    try {
+        const body = JSON.parse(String(err?.message || "").replace(/^\d+\s+/, ""));
+        const f = body?.error?.failed_generation;
+        if (typeof f === "string" && f.trim()) return f;
+    } catch {
+        // not JSON, ignore
+    }
+    return null;
+}
+
+function rescueReply(raw) {
+    let text = String(raw).trim();
+
+    // Case 1: it is actually valid JSON with a reply inside
+    try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed.reply === "string") return JSON.stringify(parsed);
+    } catch {
+        // continue
+    }
+
+    // Case 2: broken JSON, but the reply text can still be pulled out
+    const m = text.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (m) {
+        try {
+            text = JSON.parse(`"${m[1]}"`);
+        } catch {
+            text = m[1];
+        }
+    }
+
+    // Case 3: plain text. Use it as it is.
+    return JSON.stringify({
+        reply: text,
+        intent: "general",
+        action: "none",
+        leadScore: 0,
+        needsHuman: false,
+        appointmentRequested: false,
+        customerName: null,
+        businessName: null,
+        industry: null,
+        location: null,
+        interestedService: null,
+        budget: null,
+        summary: "",
+    });
+}
+
 async function askGroq(systemPrompt, messages = []) {
     try {
         const completion = await groq.chat.completions.create({
@@ -55,6 +114,11 @@ async function askGroq(systemPrompt, messages = []) {
         return content;
 
     } catch (err) {
+        const rescued = failedGenerationFrom(err);
+        if (rescued) {
+            console.warn("⚠️ The AI answered in plain text instead of JSON. Using its text as the reply.");
+            return rescueReply(rescued);
+        }
         console.error(`❌ Groq Error (model: ${MODEL}):`, err.message);
         throw err;
     }

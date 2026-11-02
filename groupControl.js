@@ -18,8 +18,23 @@ function save(data) {
 const clean = (j) => (j || '').split(':')[0].split('@')[0];
 const isGroup = (jid) => typeof jid === 'string' && jid.endsWith('@g.us');
 
+// What happens in a group the admin never configured. Render wipes data/groups.json on every
+// restart, so without a default Aria would go silent in all groups after each deploy.
+//   GROUP_DEFAULT=mention  (default) reply only when tagged or replied to
+//   GROUP_DEFAULT=all      reply to every message (WhatsApp may flag a busy bot, use with care)
+//   GROUP_DEFAULT=off      stay silent until you turn the group on with /group on
+// A group you set with /group on, /group off or /group mode always wins over this default.
+const GROUP_DEFAULT = String(process.env.GROUP_DEFAULT || 'mention').trim().toLowerCase();
+
+function groupConfig(jid) {
+  const saved = load()[jid];
+  if (saved) return saved;
+  if (GROUP_DEFAULT === 'off') return null;
+  return { enabled: true, mode: GROUP_DEFAULT === 'all' ? 'all' : 'mention', isDefault: true };
+}
+
 function isGroupAllowed(jid) {
-  return !!load()[jid]?.enabled;
+  return !!groupConfig(jid)?.enabled;
 }
 
 function setGroup(jid, enabled, name) {
@@ -45,7 +60,7 @@ function shouldReplyInGroup(msg, botIds) {
   if (msg.key?.fromMe) return false; // never reply to own messages
 
   const jid = msg.key.remoteJid;
-  const g = load()[jid];
+  const g = groupConfig(jid);
   if (!g?.enabled) return false;
   if (g.mode === 'all') return true;
 
@@ -121,8 +136,8 @@ async function handleGroupCommand(sock, msg, text, isAdmin) {
     return (
       groups
         .map((g, i) => {
-          const s = saved[g.jid];
-          const status = s?.enabled ? `✅ ON (${s.mode})` : '⛔ OFF';
+          const s = groupConfig(g.jid);
+          const status = s?.enabled ? `✅ ON (${s.mode}${s.isDefault ? ', default' : ''})` : '⛔ OFF';
           return `${i + 1}. ${g.name} - ${status}`;
         })
         .join('\n') + '\n\nTurn one on with: /group on <number>'

@@ -41,6 +41,15 @@ async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
             content: item.message
         }));
 
+        // A reminder placed right before the answer, so Aria matches the language of the LAST
+        // message (Pidgin, Yoruba, English...) and keeps to the JSON format. Not saved to history.
+        messages.push({
+            role: "system",
+            content:
+                "Reply to the last message above in the SAME language and style it is written in " +
+                "(for example Nigerian Pidgin gets a Pidgin reply). Return only the JSON object.",
+        });
+
         // Time spent thinking counts toward the "typing..." time, so replies feel human
         const thinkStart = Date.now();
 

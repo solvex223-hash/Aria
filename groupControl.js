@@ -5,14 +5,80 @@ const path = require('path');
 
 const FILE = path.join(__dirname, 'data', 'groups.json');
 
+// Render wipes the data folder on every restart, so group settings are also backed up in the
+// same Supabase table that keeps the WhatsApp login (under its own session name, so it never
+// touches the login). Without Supabase keys, settings live only in data/groups.json.
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const REMOTE = Boolean(SUPABASE_URL && SUPABASE_KEY);
+const REMOTE_SESSION = `${process.env.WA_SESSION_ID || 'aria'}-settings`;
+const REMOTE_HEADERS = {
+  apikey: SUPABASE_KEY,
+  Authorization: `Bearer ${SUPABASE_KEY}`,
+  'Content-Type': 'application/json',
+};
+
+let cache = null;
+
 function load() {
-  try { return JSON.parse(fs.readFileSync(FILE, 'utf8')); }
-  catch { return {}; }
+  if (cache) return cache;
+  try { cache = JSON.parse(fs.readFileSync(FILE, 'utf8')); }
+  catch { cache = {}; }
+  return cache;
 }
 
 function save(data) {
-  fs.mkdirSync(path.dirname(FILE), { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(data, null, 2));
+  cache = data;
+  try {
+    fs.mkdirSync(path.dirname(FILE), { recursive: true });
+    fs.writeFileSync(FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.warn('⚠️ Could not write data/groups.json:', e.message);
+  }
+  pushRemote(data);
+}
+
+async function pushRemote(data) {
+  if (!REMOTE) return;
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/wa_auth?on_conflict=session,id`, {
+      method: 'POST',
+      headers: { ...REMOTE_HEADERS, Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify([
+        { session: REMOTE_SESSION, id: 'groups', value: JSON.stringify(data), updated_at: new Date().toISOString() },
+      ]),
+    });
+    if (!res.ok) console.warn('⚠️ Could not back up group settings to Supabase:', res.status);
+  } catch (e) {
+    console.warn('⚠️ Could not back up group settings to Supabase:', e.message);
+  }
+}
+
+// Call once when the bot starts: brings back the group settings saved before the last restart.
+let restored = false;
+async function initGroupStore() {
+  if (!REMOTE || restored) return; // only once, so a reconnect never overwrites newer choices
+  restored = true;
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/wa_auth?session=eq.${encodeURIComponent(REMOTE_SESSION)}&id=eq.groups&select=value`,
+      { headers: REMOTE_HEADERS }
+    );
+    if (!res.ok) throw new Error(`Supabase answered ${res.status}`);
+    const rows = await res.json();
+    if (rows[0]?.value) {
+      cache = JSON.parse(rows[0].value);
+      try {
+        fs.mkdirSync(path.dirname(FILE), { recursive: true });
+        fs.writeFileSync(FILE, JSON.stringify(cache, null, 2));
+      } catch {
+        // the local copy is optional
+      }
+      console.log(`👥 Group settings restored (${Object.keys(cache).filter((k) => k !== '__default').length} groups).`);
+    }
+  } catch (e) {
+    console.warn('⚠️ Could not restore group settings from Supabase:', e.message);
+  }
 }
 
 const clean = (j) => (j || '').split(':')[0].split('@')[0];
@@ -26,10 +92,17 @@ const isGroup = (jid) => typeof jid === 'string' && jid.endsWith('@g.us');
 // A group you set with /group on, /group off or /group mode always wins over this default.
 const GROUP_DEFAULT = String(process.env.GROUP_DEFAULT || 'mention').trim().toLowerCase();
 
+// "/groups on" and "/groups off" also change this default, so groups Aria joins later follow the
+// same choice. It is stored under the key __default.
+function currentDefault() {
+  const saved = load().__default;
+  return saved === 'on' || saved === 'off' ? saved : GROUP_DEFAULT === 'off' ? 'off' : 'on';
+}
+
 function groupConfig(jid) {
   const saved = load()[jid];
   if (saved) return saved;
-  if (GROUP_DEFAULT === 'off') return null;
+  if (currentDefault() === 'off') return null;
   return { enabled: true, mode: GROUP_DEFAULT === 'all' ? 'all' : 'mention', isDefault: true };
 }
 
@@ -51,6 +124,29 @@ function setGroup(jid, enabled, name) {
 function setMode(jid, mode, name) {
   const data = load();
   data[jid] = { enabled: false, ...data[jid], mode, name: name || data[jid]?.name || jid };
+  save(data);
+}
+
+// Turn many groups on or off with a single save.
+function setMany(groups, enabled) {
+  const data = load();
+  for (const g of groups) {
+    data[g.jid] = { mode: 'mention', ...data[g.jid], enabled, name: g.name || data[g.jid]?.name || g.jid };
+  }
+  save(data);
+}
+
+function setDefault(value) {
+  const data = load();
+  data.__default = value;
+  save(data);
+}
+
+function setModeMany(groups, mode) {
+  const data = load();
+  for (const g of groups) {
+    data[g.jid] = { enabled: false, ...data[g.jid], mode, name: g.name || data[g.jid]?.name || g.jid };
+  }
   save(data);
 }
 
@@ -105,13 +201,36 @@ function pickGroup(groups, query) {
   };
 }
 
+// Works out which groups a command means: "all", several numbers ("1 3 5" or "1,3,5"),
+// one number, or part of a group name.
+function pickTargets(groups, query) {
+  const q = (query || '').trim();
+  if (!q) return { error: 'Tell me which group: all, a number from /groups, or part of its name.' };
+  if (!groups.length) return { error: 'Aria is not in any groups yet.' };
+  if (/^all$/i.test(q)) return { groups, all: true };
+  if (/^\d+([\s,]+\d+)+$/.test(q)) {
+    const picked = [];
+    for (const n of q.split(/[\s,]+/)) {
+      const g = groups[Number(n) - 1];
+      if (!g) return { error: `No group number ${n}. Send /groups to see the list.` };
+      if (!picked.includes(g)) picked.push(g);
+    }
+    return { groups: picked };
+  }
+  const { group, error } = pickGroup(groups, q);
+  return error ? { error } : { groups: [group] };
+}
+
 const GROUP_HELP =
   '👥 *Group controls* (send these here, not inside the group)\n' +
   '/groups - list all groups with ON/OFF status\n' +
-  '/group on <number or name> - Aria replies in that group\n' +
-  '/group off <number or name> - Aria stops replying there\n' +
-  '/group mode mention <number or name> - reply only when tagged or replied to\n' +
-  '/group mode all <number or name> - reply to every message';
+  '/groups on - turn ALL groups on (new groups too)\n' +
+  '/groups off - turn ALL groups off (new groups too)\n' +
+  '/group on <number or name> - turn one group on\n' +
+  '/group off <number or name> - turn one group off\n' +
+  '/group on 1 3 5 - turn several on at once (same for off)\n' +
+  '/group mode mention <number, name or all> - reply only when tagged or replied to\n' +
+  '/group mode all <number, name or all> - reply to every message';
 
 // Handles group-control commands. Returns reply text, or null if not a group command.
 // Only call this for PRIVATE chats, and only when the sender is the admin.
@@ -129,8 +248,6 @@ async function handleGroupCommand(sock, msg, text, isAdmin) {
     return '⚠️ Could not load your groups right now. Try again in a moment.';
   }
 
-  const saved = load();
-
   if (t === '/groups') {
     if (!groups.length) return 'Aria is not in any groups yet.';
     return (
@@ -140,39 +257,49 @@ async function handleGroupCommand(sock, msg, text, isAdmin) {
           const status = s?.enabled ? `✅ ON (${s.mode}${s.isDefault ? ', default' : ''})` : '⛔ OFF';
           return `${i + 1}. ${g.name} - ${status}`;
         })
-        .join('\n') + '\n\nTurn one on with: /group on <number>'
+        .join('\n') +
+      '\n\n/groups on = all on, /groups off = all off\n/group on <number> or /group off <number> = one group'
     );
   }
 
-  let m;
-  if ((m = raw.match(/^\/group\s+on\s+(.+)$/i))) {
-    const { group, error } = pickGroup(groups, m[1]);
-    if (error) return error;
-    setGroup(group.jid, true, group.name);
-    return `✅ Aria is now ON in "${group.name}" (mode: ${load()[group.jid].mode}).`;
+  // ALL groups at once: "/groups on", "/groups off", "/group on all", "/group off all"
+  let m = raw.match(/^\/groups?\s+(on|off)(?:\s+all)?\s*$/i);
+  if (m) {
+    const on = m[1].toLowerCase() === 'on';
+    if (!groups.length) return 'Aria is not in any groups yet.';
+    setMany(groups, on);
+    setDefault(on ? 'on' : 'off');
+    return on
+      ? `✅ Aria is now ON in all ${groups.length} groups (and in new groups she joins). She replies when tagged or replied to, unless a group is set to "all".`
+      : `⛔ Aria is now OFF in all ${groups.length} groups (and in new groups she joins). Turn one back on with /group on <number>.`;
   }
 
-  if ((m = raw.match(/^\/group\s+off\s+(.+)$/i))) {
-    const { group, error } = pickGroup(groups, m[1]);
+  // One group, or several: "/group on 3", "/group on 1 3 5", "/group off media"
+  if ((m = raw.match(/^\/group\s+(on|off)\s+(.+)$/i))) {
+    const on = m[1].toLowerCase() === 'on';
+    const { groups: picked, error } = pickTargets(groups, m[2]);
     if (error) return error;
-    setGroup(group.jid, false, group.name);
-    return `⛔ Aria is now OFF in "${group.name}".`;
+    setMany(picked, on);
+    const names = picked.map((g) => `"${g.name}"`).join(', ');
+    return on ? `✅ Aria is now ON in ${names}.` : `⛔ Aria is now OFF in ${names}.`;
   }
 
   if ((m = raw.match(/^\/group\s+mode\s+(mention|all)\s+(.+)$/i))) {
     const mode = m[1].toLowerCase();
-    const { group, error } = pickGroup(groups, m[2]);
+    const { groups: picked, error } = pickTargets(groups, m[2]);
     if (error) return error;
-    setMode(group.jid, mode, group.name);
+    setModeMany(picked, mode);
+    const who = picked.length === 1 ? `"${picked[0].name}"` : `${picked.length} groups`;
     return mode === 'mention'
-      ? `"${group.name}": replies only when tagged or replied to.`
-      : `"${group.name}": replies to every message.`;
+      ? `${who}: replies only when tagged or replied to.`
+      : `${who}: replies to every message.`;
   }
 
   return GROUP_HELP;
 }
 
 module.exports = {
+  initGroupStore,
   isGroup,
   isGroupAllowed,
   shouldReplyInGroup,

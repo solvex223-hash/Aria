@@ -14,12 +14,17 @@ const {
 const pino = require("pino");
 const qrcode = require("qrcode-terminal");
 
+// Create the database tables (conversations, customers, leads...) before anything uses them.
+// On a fresh server such as Render there is no database file yet, so without this every reply
+// failed with "no such table: conversations".
+require("./src/database/schema")();
+
 const { openAuthStore, clearAuthStore, describeAuthStore } = require("./src/whatsapp/authStore");
 
 const { handleAdmin } = require("./src/handlers/admin");
 const { handleCustomer } = require("./src/handlers/customer");
 const { isAllowed, getSetting, isBlocked, removeAllowed } = require("./src/database/access");
-const { isGroup, shouldReplyInGroup, handleGroupCommand, GROUP_HELP } = require("./groupControl");
+const { isGroup, shouldReplyInGroup, handleGroupCommand, GROUP_HELP, initGroupStore } = require("./groupControl");
 const { setTyping, markRead, readPause } = require("./src/whatsapp/typing");
 
 // Voice note and image helpers. If a file path is wrong, Aria still starts
@@ -394,6 +399,8 @@ async function requestCodeOnce(sock, myGen, pairing) {
 // ---------------------------------------------------------------------------
 
 async function startBot() {
+  // Bring back the group ON/OFF choices saved before the last restart
+  await initGroupStore();
   const myGen = ++generation;
   clearTimeout(restartTimer);
   connected = false;

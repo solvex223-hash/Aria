@@ -167,6 +167,8 @@ function shouldReplyInGroup(msg, botIds) {
     m.imageMessage?.contextInfo ||
     m.audioMessage?.contextInfo ||
     m.videoMessage?.contextInfo ||
+    m.stickerMessage?.contextInfo ||
+    m.documentMessage?.contextInfo ||
     {};
 
   const mentioned = (ctx.mentionedJid || []).some((j) => ids.includes(clean(j)));

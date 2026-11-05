@@ -6,6 +6,8 @@ const memory = require("../services/memoryService");
 const notification = require("../services/notificationService");
 const { isBotEnabled } = require("../utils/botState");
 const { typingDelay } = require("../whatsapp/typing");
+const { languageInstruction } = require("../ai/languageHint");
+const { vibeBlock } = require("../services/groupVibe");
 
 async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
     const { isGroup = false, groupJid = null, quotedMsg = null } = options;
@@ -23,7 +25,7 @@ async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
         if (!text || !text.trim()) {
             const fallback = "I'm sorry, I didn't catch that. Could you please send it again? 😊";
             if (isGroup && quotedMsg) {
-                await sock.sendMessage(conversationKey, { text: fallback, quoted: quotedMsg });
+                await sock.sendMessage(conversationKey, { text: fallback }, { quoted: quotedMsg });
             } else {
                 await sendMessage(sock, conversationKey, fallback);
             }
@@ -41,13 +43,22 @@ async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
             content: item.message
         }));
 
-        // A reminder placed right before the answer, so Aria matches the language of the LAST
-        // message (Pidgin, Yoruba, English...) and keeps to the JSON format. Not saved to history.
+        // In groups, show Aria what people have just been saying and the mood of the room, so her
+        // reply fits in. This lives in memory only and is never saved.
+        if (isGroup) {
+            const vibe = vibeBlock(groupJid || conversationKey);
+            if (vibe) {
+                messages.push({ role: "system", content: vibe });
+            }
+        }
+
+        // A reminder placed right before the answer. It names the language of the LAST message
+        // (English, Pidgin, Yoruba...) so Aria switches when the person switches, instead of copying
+        // the language of her own earlier replies. Not saved to history.
+        const customerTexts = history.filter((item) => item.role === "user").map((item) => item.message);
         messages.push({
             role: "system",
-            content:
-                "Reply to the last message above in the SAME language and style it is written in " +
-                "(for example Nigerian Pidgin gets a Pidgin reply). Return only the JSON object.",
+            content: `${languageInstruction(customerTexts)} Return only the JSON object.`,
         });
 
         // Time spent thinking counts toward the "typing..." time, so replies feel human
@@ -102,7 +113,7 @@ async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
 
         // Reply to customer (quote in groups)
         if (isGroup && quotedMsg) {
-            await sock.sendMessage(conversationKey, { text: ai.reply, quoted: quotedMsg });
+            await sock.sendMessage(conversationKey, { text: ai.reply }, { quoted: quotedMsg });
         } else {
             await sendMessage(
                 sock,
@@ -118,7 +129,7 @@ async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
         // Only send fallback if we haven't already sent a response
         const fallback = "I'm sorry, something went wrong. Please try again in a moment 😊";
         if (isGroup && quotedMsg) {
-            await sock.sendMessage(conversationKey, { text: fallback, quoted: quotedMsg });
+            await sock.sendMessage(conversationKey, { text: fallback }, { quoted: quotedMsg });
         } else {
             await sendMessage(sock, conversationKey, fallback);
         }

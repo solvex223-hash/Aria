@@ -24,7 +24,7 @@ const { openAuthStore, clearAuthStore, describeAuthStore } = require("./src/what
 const { handleAdmin } = require("./src/handlers/admin");
 const { handleCustomer } = require("./src/handlers/customer");
 const { isAllowed, getSetting, isBlocked, removeAllowed } = require("./src/database/access");
-const { isGroup, shouldReplyInGroup, handleGroupCommand, GROUP_HELP, initGroupStore } = require("./groupControl");
+const { isGroup, isGroupAllowed, shouldReplyInGroup, handleGroupCommand, GROUP_HELP, initGroupStore } = require("./groupControl");
 const { setTyping, markRead, readPause } = require("./src/whatsapp/typing");
 
 // Voice note and image helpers. If a file path is wrong, Aria still starts
@@ -41,6 +41,15 @@ try {
 } catch (err) {
   console.warn("⚠️ Images are OFF: could not load ./src/ai/vision.js -", err.message);
 }
+
+// Stickers and videos, and the group "vibe" memory
+let mediaUnderstanding = null;
+try {
+  mediaUnderstanding = require("./src/ai/mediaUnderstanding");
+} catch (err) {
+  console.warn("⚠️ Stickers and videos are OFF: could not load ./src/ai/mediaUnderstanding.js -", err.message);
+}
+const { rememberGroupMessage, isCalledByName } = require("./src/services/groupVibe");
 
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || "").replace(/\D/g, "");
 // Human-like behaviour (blue ticks, "typing...", a short pause) lives in ./src/whatsapp/typing.js.
@@ -70,6 +79,8 @@ const VOICE_FAIL_REPLY =
   "Sorry, I couldn't hear that voice note properly. Could you send it again or type it out?";
 const IMAGE_FAIL_REPLY =
   "Sorry, I couldn't open that picture. Could you send it again or tell me what's in it?";
+const VIDEO_FAIL_REPLY =
+  "Sorry, I couldn't open that video. Could you send it again or tell me what's in it?";
 
 // Web server settings. Render sets PORT automatically.
 // ARIA_SEND_KEY is the shared secret the Solvex daily-report route sends in the x-api-key header.
@@ -210,6 +221,42 @@ async function imageToText(msg, sock, image) {
       : `[The customer sent a picture. What it shows: ${description}]`;
   } catch (err) {
     console.error("❌ Image failed:", err.message);
+    return "";
+  }
+}
+
+// Sticker -> text for Aria to read (what it shows and the feeling it gives).
+// Returns "" if anything goes wrong, and then Aria simply stays quiet.
+async function stickerToText(msg, sock, sticker) {
+  if (!mediaUnderstanding) return "";
+  try {
+    const buffer = await downloadMedia(msg, sock);
+    const description = await mediaUnderstanding.describeSticker(buffer, sticker);
+    if (!description) return "";
+    console.log("🎭 Sticker read");
+    return `[The person sent a sticker. What it shows and the feeling it gives: ${description}]`;
+  } catch (err) {
+    console.error("❌ Sticker failed:", err.message);
+    return "";
+  }
+}
+
+// Video -> text for Aria to read (what happens in it, plus anything said in it).
+// Returns "" if anything goes wrong.
+async function videoToText(msg, sock, video) {
+  if (!mediaUnderstanding) return "";
+  try {
+    const { description, speech } = await mediaUnderstanding.describeVideo(() => downloadMedia(msg, sock), video);
+    if (!description && !speech) return "";
+    console.log("🎬 Video read");
+    const caption = (video.caption || "").trim();
+    const marker =
+      `[The person sent a video. What happens in it: ${description || "unclear"}.` +
+      (speech ? ` What is said in it: "${speech}".` : "") +
+      "]";
+    return caption ? `${caption}\n\n${marker}` : marker;
+  } catch (err) {
+    console.error("❌ Video failed:", err.message);
     return "";
   }
 }
@@ -594,6 +641,17 @@ async function startBot() {
     const isAdminSender = senderNumber === ADMIN_NUMBER;
     const isSelfChatFromMe = msg.key.fromMe && isOwnChat(sock, msg.key);
 
+    // Group vibe: while Aria is turned on in a group, she quietly remembers the last few messages
+    // (in memory only, nothing is saved or sent) so she can fit the mood when someone talks to her.
+    if (isGroupChat && type === "notify" && isGroupAllowed(remoteJid)) {
+      rememberGroupMessage(remoteJid, {
+        who: msg.pushName || `+${senderNumber.slice(-4)}`,
+        text,
+        content,
+        fromMe: Boolean(msg.key.fromMe),
+      });
+    }
+
     if (msg.key.fromMe) {
       // Aria runs on the admin's own number, so the "Message yourself" chat is where the admin
       // types commands. Only live messages typed by the admin count ("notify"). Aria's own replies
@@ -621,11 +679,13 @@ async function startBot() {
 
     const audio = content.audioMessage;
     const image = content.imageMessage;
+    const sticker = content.stickerMessage;
+    const video = content.videoMessage;
 
-    // Nothing Aria can read (stickers, reactions and so on). Videos and files in a private chat
-    // still get a short friendly note further down.
-    const isVideoOrFile = Boolean(content.videoMessage || content.documentMessage);
-    if (!text && !audio && !image && !isVideoOrFile) return;
+    // Nothing Aria can read (reactions and so on). Files in a private chat still get a short
+    // friendly note further down.
+    const isFile = Boolean(content.documentMessage);
+    if (!text && !audio && !image && !sticker && !video && !isFile) return;
 
     // ===== PRIVATE CHATS =====
     if (!isGroupChat) {
@@ -674,10 +734,10 @@ async function startBot() {
 
       await markRead(sock, msg);
 
-      if (!text && !audio && !image) {
+      if (!text && !audio && !image && !sticker && !video) {
         await sleep(readPause());
         await sock.sendMessage(sender, {
-          text: "Got it 😊 I can't open videos or files yet. Send me a voice note, a picture, or just type what you need.",
+          text: "Got it 😊 I can't open files yet. Send me a voice note, a picture, a sticker, a video, or just type what you need.",
         });
         return;
       }
@@ -701,6 +761,18 @@ async function startBot() {
             await sock.sendMessage(sender, { text: IMAGE_FAIL_REPLY });
             return;
           }
+        } else if (sticker) {
+          customerText = await stickerToText(msg, sock, sticker);
+          if (!customerText) {
+            console.log("🎭 Could not read this sticker, staying quiet.");
+            return;
+          }
+        } else if (video) {
+          customerText = await videoToText(msg, sock, video);
+          if (!customerText) {
+            await sock.sendMessage(sender, { text: VIDEO_FAIL_REPLY });
+            return;
+          }
         }
 
 
@@ -717,8 +789,17 @@ async function startBot() {
     // ===== GROUP CHATS =====
     // Check if we should reply in this group
     const botIds = [sock.user?.id, sock.user?.lid];
-    if (!shouldReplyInGroup(msg, botIds)) {
+    // Aria answers when she is tagged, when someone replies to her, or when someone calls her name
+    // (GROUP_TRIGGER_WORDS, default "aria") in a group she is turned on in.
+    const calledByName = isGroupAllowed(remoteJid) && isCalledByName(text);
+    if (!shouldReplyInGroup(msg, botIds) && !calledByName) {
       return; // silently ignore
+    }
+
+    // Numbers turned off with /off never get a reply in groups either
+    if (isBlocked(senderNumber)) {
+      console.log(`🛑 Ignored +${senderNumber} in a group (turned off with /off)`);
+      return;
     }
 
     // Log group JID and mentionedJid for debugging
@@ -740,7 +821,7 @@ async function startBot() {
       cleanText = cleanText.replace(pattern, "").trim();
     }
 
-    if (!text && !audio && !image) return;
+    if (!text && !audio && !image && !sticker && !video) return;
     if (overRateLimit(remoteJid)) {
       console.log(`⏱️ Too many replies in group ${remoteJid} in the last minute, skipping this one`);
       return;
@@ -757,13 +838,25 @@ async function startBot() {
       if (audio) {
         customerText = await voiceNoteToText(msg, sock, audio);
         if (!customerText) {
-          await sock.sendMessage(remoteJid, { text: VOICE_FAIL_REPLY, quoted: msg });
+          await sock.sendMessage(remoteJid, { text: VOICE_FAIL_REPLY }, { quoted: msg });
           return;
         }
       } else if (image) {
         customerText = await imageToText(msg, sock, image);
         if (!customerText) {
-          await sock.sendMessage(remoteJid, { text: IMAGE_FAIL_REPLY, quoted: msg });
+          await sock.sendMessage(remoteJid, { text: IMAGE_FAIL_REPLY }, { quoted: msg });
+          return;
+        }
+      } else if (sticker) {
+        customerText = await stickerToText(msg, sock, sticker);
+        if (!customerText) {
+          console.log("🎭 Could not read this sticker, staying quiet.");
+          return;
+        }
+      } else if (video) {
+        customerText = await videoToText(msg, sock, video);
+        if (!customerText) {
+          await sock.sendMessage(remoteJid, { text: VIDEO_FAIL_REPLY }, { quoted: msg });
           return;
         }
       }
@@ -778,7 +871,7 @@ async function startBot() {
       });
     } catch (err) {
       console.error("Error handling group message:", err);
-      await sock.sendMessage(remoteJid, { text: "Sorry, I'm having trouble right now. Please try again shortly.", quoted: msg });
+      await sock.sendMessage(remoteJid, { text: "Sorry, I'm having trouble right now. Please try again shortly." }, { quoted: msg });
     } finally {
       await setTyping(sock, remoteJid, false);
     }

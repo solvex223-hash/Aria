@@ -37,7 +37,7 @@ function validateAIResponse(response) {
 
         return {
 
-            reply: "Sorry, something went wrong. Please try again 😊",
+            reply: "Sorry, I lost my train of thought for a moment 😅 Could you send that again?",
 
             intent: "error",
 

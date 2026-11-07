@@ -5,6 +5,7 @@
 //   /list           who Aria replies to, and who is turned off
 //   /all on         reply to everyone who messages (except numbers turned off)
 //   /all off        reply only to numbers turned on with /on
+//   /ai             AI status: which models are ready or resting, and what was used today
 //   /help           show this list
 //
 // Numbers can be typed as 08012345678, +234 801 234 5678 or 2348012345678.
@@ -19,6 +20,7 @@ const {
   listBlocked,
 } = require("../database/access");
 const { GROUP_HELP } = require("../../groupControl");
+const aiHealth = require("../services/aiHealth");
 
 // "0803 123 4567", "+234 803 123 4567", "2348031234567" -> "2348031234567"
 function normalizePhone(input) {
@@ -38,6 +40,7 @@ const HELP_TEXT = [
   "/list - who Aria replies to",
   "/all on - reply to everyone (except numbers turned off)",
   "/all off - reply only to numbers turned on",
+  "/ai - AI status (which models are ready or resting)",
   "/help - this list",
   "",
   "Number example: 08012345678 or 2348012345678",
@@ -93,6 +96,10 @@ async function handleAdmin(sock, sender, text) {
         return await reply("🔒 Aria will only reply to numbers you turned on with /on.");
       }
       return await reply("Use /all on or /all off");
+    }
+
+    if (cmd === "/ai") {
+      return await reply(aiHealth.statusText());
     }
 
     if (cmd === "/help") {

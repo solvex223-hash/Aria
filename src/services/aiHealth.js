@@ -74,14 +74,18 @@ async function reportFailure(sock, err) {
 function statusText() {
   const rows = llm.status();
   if (!rows.length) return "No AI provider is set up. Add GROQ_API_KEY in Render's Environment tab.";
-  const lines = rows.map((r) => {
+  const fmt = (r) => {
     const state = r.ready ? "✅ ready" : `⏸️ resting ${r.resting} (${r.reason})`;
     const used = r.requestsToday ? ` - ${r.requestsToday} replies, ${r.tokensToday.toLocaleString("en-US")} tokens today` : "";
     return `${r.n}. ${r.label}: ${state}${used}`;
-  });
+  };
   return [
     "🤖 *Aria AI status*",
-    ...lines,
+    "*Chat replies*",
+    ...rows.map(fmt),
+    "",
+    "*Pictures, stickers and videos*",
+    ...llm.status("vision").map(fmt),
     "",
     "Aria uses the first one that is ready. Counts reset when Aria restarts.",
     "Groq free plan: about 200,000 tokens a day and 8,000 a minute for EACH model. Every reply sends Aria's full instructions and knowledge base (several thousand tokens), so the free allowance covers fewer chats than you might expect.",

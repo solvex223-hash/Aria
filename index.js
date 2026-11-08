@@ -78,9 +78,11 @@ function overRateLimit(jid) {
 const VOICE_FAIL_REPLY =
   "Sorry, I couldn't hear that voice note properly. Could you send it again or type it out?";
 const IMAGE_FAIL_REPLY =
-  "Sorry, I couldn't open that picture. Could you send it again or tell me what's in it?";
+  "Sorry, I couldn't open that picture right now. Please send it again in a minute, or just tell me what's in it 😊";
 const VIDEO_FAIL_REPLY =
-  "Sorry, I couldn't open that video. Could you send it again or tell me what's in it?";
+  "Sorry, I couldn't open that video right now. Please send it again in a minute, or just tell me what's in it 😊";
+// Sent in private chats when a sticker cannot be read (set STICKER_FALLBACK=off to stay quiet instead)
+const STICKER_FALLBACK = process.env.STICKER_FALLBACK === undefined ? "😊" : process.env.STICKER_FALLBACK.trim();
 
 // Web server settings. Render sets PORT automatically.
 // ARIA_SEND_KEY is the shared secret the Solvex daily-report route sends in the x-api-key header.
@@ -634,6 +636,8 @@ async function startBot() {
     const participant = msg.key.participant || remoteJid;
     const sender = participant; // where replies are sent
     const senderNumber = await resolveSenderNumber(sock, msg.key, isGroupChat); // real phone number
+    // False when WhatsApp hides the phone number behind an ID, so alerts do not show a wrong number
+    const numberKnown = !String(sender).endsWith("@lid") || senderNumber !== jidNumber(sender);
     const content = normalizeContent(msg.message);
     const text = content.conversation || content.extendedTextMessage?.text || "";
 
@@ -764,7 +768,10 @@ async function startBot() {
         } else if (sticker) {
           customerText = await stickerToText(msg, sock, sticker);
           if (!customerText) {
-            console.log("🎭 Could not read this sticker, staying quiet.");
+            console.log("🎭 Could not read this sticker.");
+            if (STICKER_FALLBACK && STICKER_FALLBACK.toLowerCase() !== "off") {
+              await sock.sendMessage(sender, { text: STICKER_FALLBACK });
+            }
             return;
           }
         } else if (video) {
@@ -776,7 +783,7 @@ async function startBot() {
         }
 
 
-        await handleCustomer(sock, sender, senderNumber, customerText);
+        await handleCustomer(sock, sender, senderNumber, customerText, { pushName: msg.pushName || "", numberKnown });
       } catch (err) {
         console.error("Error handling customer message:", err);
         await sock.sendMessage(sender, { text: "Sorry, I'm having trouble right now. Please try again shortly." });
@@ -867,7 +874,9 @@ async function startBot() {
       await handleCustomer(sock, remoteJid, senderNumber, customerText, {
         isGroup: true,
         groupJid: remoteJid,
-        quotedMsg: msg
+        quotedMsg: msg,
+        pushName: msg.pushName || "",
+        numberKnown
       });
     } catch (err) {
       console.error("Error handling group message:", err);

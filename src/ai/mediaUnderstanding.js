@@ -10,6 +10,7 @@
 // Settings (optional, in .env or Render's Environment tab):
 //   VIDEO_MAX_MB=16        videos bigger than this are not downloaded (preview picture only)
 //   VIDEO_MAX_SECONDS=30   only the first 30 seconds of a video are looked at
+//   VIDEO_FRAMES=2         pictures taken from a video (1 to 3, each costs about 2,000 tokens)
 //   FFMPEG_PATH=...        use your own ffmpeg instead of the ffmpeg-static package
 
 const fs = require("fs");
@@ -37,7 +38,8 @@ if (!ffmpegPath) {
 
 const VIDEO_MAX_BYTES = Number(process.env.VIDEO_MAX_MB || 16) * 1024 * 1024;
 const VIDEO_MAX_SECONDS = Number(process.env.VIDEO_MAX_SECONDS || 30);
-const MAX_FRAMES = 3;
+// Each picture costs about 2,000 tokens on Groq, so 2 frames is the default (VIDEO_FRAMES=1..3)
+const MAX_FRAMES = Math.min(3, Math.max(1, Number(process.env.VIDEO_FRAMES) || 2));
 
 function run(bin, args, timeout = 45000) {
   return new Promise((resolve, reject) => {
@@ -111,7 +113,9 @@ async function extractFromVideo(buffer) {
       ]);
       const files = fs.readdirSync(dir).filter((f) => /^f\d+\.jpg$/.test(f)).sort();
       const pick =
-        files.length <= MAX_FRAMES ? files : [files[0], files[Math.floor(files.length / 2)], files[files.length - 1]];
+        files.length <= MAX_FRAMES
+          ? files
+          : Array.from({ length: MAX_FRAMES }, (_, i) => files[Math.round((i * (files.length - 1)) / Math.max(1, MAX_FRAMES - 1))]);
       frames = pick.map((f) => fs.readFileSync(path.join(dir, f)));
     } catch (err) {
       console.warn(`⚠️ Could not take pictures from the video: ${err.message.slice(0, 120)} ${err.stderr || ""}`);

@@ -11,6 +11,16 @@ function getSelfChatJid(sock) {
     return `${idPart.split(":")[0]}@${domain}`;
 }
 
+// The customer's phone number for alerts. Chats that WhatsApp addresses with a hidden ID show that
+// ID instead of a number, so we say so plainly (and give the ID, which /off also understands).
+function customerNumberText(lead) {
+    const raw = lead.senderNumber || (lead.sender ? String(lead.sender).split("@")[0].split(":")[0] : "");
+    const known = lead.numberKnown === undefined ? !String(lead.sender || "").endsWith("@lid") : lead.numberKnown;
+    if (!raw) return "Unknown";
+    if (known) return `+${raw}`;
+    return `hidden by WhatsApp - open the chat with ${lead.customerName || "this person"} to reply (WhatsApp ID: ${raw})`;
+}
+
 async function notifyLead(sock, lead) {
 
     const self = getSelfChatJid(sock);
@@ -20,6 +30,8 @@ async function notifyLead(sock, lead) {
 👤 Name: ${lead.customerName || "Unknown"}
 
 🏢 Business: ${lead.businessName || "Not provided"}
+
+📞 Customer number: ${customerNumberText(lead)}
 
 💼 Service: ${lead.interestedService || "General Inquiry"}
 
@@ -47,7 +59,7 @@ async function notifyHandoff(sock, lead) {
 
 🏢 Business: ${lead.businessName || "Not provided"}
 
-📞 Customer number: ${lead.sender ? lead.sender.split("@")[0] : "Unknown"}
+📞 Customer number: ${customerNumberText(lead)}
 
 💼 Reason/Service: ${lead.interestedService || lead.summary || "Not specified"}
 
@@ -71,7 +83,7 @@ async function notifyAppointment(sock, lead) {
 
 🏢 Business: ${lead.businessName || "Not provided"}
 
-📞 Customer number: ${lead.sender ? lead.sender.split("@")[0] : "Unknown"}
+📞 Customer number: ${customerNumberText(lead)}
 
 💼 Service: ${lead.interestedService || "General Inquiry"}
 

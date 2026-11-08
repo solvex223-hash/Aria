@@ -16,7 +16,7 @@ const HISTORY_MESSAGES = Math.max(4, Number(process.env.HISTORY_MESSAGES) || 14)
 const HISTORY_MAX_CHARS = Math.max(200, Number(process.env.HISTORY_MAX_CHARS) || 700);
 
 async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
-    const { isGroup = false, groupJid = null, quotedMsg = null } = options;
+    const { isGroup = false, groupJid = null, quotedMsg = null, pushName = "", numberKnown = true } = options;
     const conversationKey = isGroup ? groupJid : sender;
     let customerTexts = [];
 
@@ -93,6 +93,11 @@ async function handleCustomer(sock, sender, senderNumber, text, options = {}) {
         // Attach sender so notification messages can tell you who to
         // reply to and reference the right chat
         ai.sender = sender;
+        ai.senderNumber = senderNumber;     // the real phone number when WhatsApp lets us see it
+        ai.numberKnown = numberKnown;       // false when WhatsApp hides the number behind an ID
+        if (!ai.customerName && pushName) {
+            ai.customerName = pushName;     // the name on their WhatsApp profile
+        }
 
         console.log("🤖 Intent:", ai.intent);
 

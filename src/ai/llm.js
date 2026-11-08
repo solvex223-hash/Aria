@@ -10,10 +10,17 @@
 //
 // The order Aria tries (only the ones that are set up are used):
 //   1. GROQ_TEXT_MODEL                       (default openai/gpt-oss-20b)
-//   2. GROQ_FALLBACK_MODELS                  (default openai/gpt-oss-120b,qwen/qwen3.8-27b)
+//   2. GROQ_FALLBACK_MODELS                  (default openai/gpt-oss-120b,qwen/qwen3.6-27b)
 //   3. Gemini  if GEMINI_API_KEY is set      (model GEMINI_MODEL, default gemini-3.5-flash-lite)
 //   4. Any other OpenAI-compatible service   if LLM_EXTRA_BASE_URL, LLM_EXTRA_API_KEY, LLM_EXTRA_MODEL are set
 // For hard languages (Georgian, Arabic, Spanish...) the Gemini backup is tried first when it is set up.
+//
+// Pictures, stickers and video frames use their own list of models that can SEE images (a model that only
+// reads text cannot be used for them):
+//   1. GROQ_VISION_MODELS                    (default qwen/qwen3.8-27b)
+//   2. GROQ_VISION_FALLBACK_MODELS           (default qwen/qwen3.6-27b)
+//   3. Gemini  if GEMINI_API_KEY is set
+// Each picture costs about 2,000 tokens on Groq, so pictures use up the free limit quickly.
 //
 // Optional settings: LLM_TIMEOUT_MS=30000, LLM_MAX_WAIT_MS=15000 (longest Aria will wait for a limit to clear)
 
@@ -45,42 +52,71 @@ class LlmError extends Error {
 // Which providers and models are set up
 // ---------------------------------------------------------------------------
 
+const clean = (s) => String(s || "").trim();
+const csv = (s) => String(s || "").split(",").map(clean).filter(Boolean);
+
+// One shared object per provider+model, so a limit hit by a text chat also protects pictures (and the
+// other way round): both lists point at the same objects and the same "resting" state.
+const registry = new Map();
+function shared(def) {
+  if (!registry.has(def.id)) registry.set(def.id, def);
+  return registry.get(def.id);
+}
+
+function groqDef(model) {
+  return shared({
+    id: `groq:${model}`,
+    label: `Groq ${model}`,
+    kind: "groq",
+    model,
+    baseUrl: clean(ENV.GROQ_BASE_URL).replace(/\/+$/, "") || "https://api.groq.com/openai/v1",
+    key: clean(ENV.GROQ_API_KEY),
+    json: true,
+    singleSystem: false,
+    strongLanguage: false,
+  });
+}
+
+function geminiDef() {
+  const model = clean(ENV.GEMINI_MODEL) || "gemini-3.5-flash-lite";
+  return shared({
+    id: "gemini",
+    label: `Gemini ${model}`,
+    kind: "gemini",
+    model,
+    baseUrl: clean(ENV.GEMINI_BASE_URL).replace(/\/+$/, "") || "https://generativelanguage.googleapis.com/v1beta/openai",
+    key: clean(ENV.GEMINI_API_KEY),
+    json: true,
+    singleSystem: true,
+    strongLanguage: true,
+  });
+}
+
+// Models that can SEE pictures (stickers, photos, video frames)
+function buildVisionEngines() {
+  const engines = [];
+  if (clean(ENV.GROQ_API_KEY)) {
+    const primary = csv(ENV.GROQ_VISION_MODELS).length ? csv(ENV.GROQ_VISION_MODELS) : ["qwen/qwen3.8-27b"];
+    const fallbackRaw = ENV.GROQ_VISION_FALLBACK_MODELS === undefined ? "qwen/qwen3.6-27b" : ENV.GROQ_VISION_FALLBACK_MODELS;
+    for (const model of [...new Set([...primary, ...csv(fallbackRaw)])]) engines.push(groqDef(model));
+  }
+  if (clean(ENV.GEMINI_API_KEY)) engines.push(geminiDef());
+  return engines;
+}
+
 function buildEngines() {
   const engines = [];
-  const clean = (s) => String(s || "").trim();
   const trimSlash = (u) => clean(u).replace(/\/+$/, "");
 
   if (clean(ENV.GROQ_API_KEY)) {
     const primary = clean(ENV.GROQ_TEXT_MODEL) || "openai/gpt-oss-20b";
-    const fallbackRaw = ENV.GROQ_FALLBACK_MODELS === undefined ? "openai/gpt-oss-120b,qwen/qwen3.8-27b" : ENV.GROQ_FALLBACK_MODELS;
-    const models = [primary, ...String(fallbackRaw).split(",").map(clean).filter(Boolean)];
-    for (const model of [...new Set(models)]) {
-      engines.push({
-        id: `groq:${model}`,
-        label: `Groq ${model}`,
-        kind: "groq",
-        model,
-        baseUrl: trimSlash(ENV.GROQ_BASE_URL) || "https://api.groq.com/openai/v1",
-        key: clean(ENV.GROQ_API_KEY),
-        json: true,
-        singleSystem: false,
-        strongLanguage: false,
-      });
-    }
+    const fallbackRaw = ENV.GROQ_FALLBACK_MODELS === undefined ? "openai/gpt-oss-120b,qwen/qwen3.6-27b" : ENV.GROQ_FALLBACK_MODELS;
+    const models = [primary, ...csv(fallbackRaw)];
+    for (const model of [...new Set(models)]) engines.push(groqDef(model));
   }
 
   if (clean(ENV.GEMINI_API_KEY)) {
-    engines.push({
-      id: "gemini",
-      label: `Gemini ${clean(ENV.GEMINI_MODEL) || "gemini-3.5-flash-lite"}`,
-      kind: "gemini",
-      model: clean(ENV.GEMINI_MODEL) || "gemini-3.5-flash-lite",
-      baseUrl: trimSlash(ENV.GEMINI_BASE_URL) || "https://generativelanguage.googleapis.com/v1beta/openai",
-      key: clean(ENV.GEMINI_API_KEY),
-      json: true,
-      singleSystem: true,
-      strongLanguage: true,
-    });
+    engines.push(geminiDef());
   }
 
   if (clean(ENV.LLM_EXTRA_BASE_URL) && clean(ENV.LLM_EXTRA_API_KEY) && clean(ENV.LLM_EXTRA_MODEL)) {
@@ -100,6 +136,7 @@ function buildEngines() {
 }
 
 const ENGINES = buildEngines();
+const VISION_ENGINES = buildVisionEngines();
 
 // What each provider is doing right now (kept in memory, resets when Aria restarts)
 const state = new Map();
@@ -177,21 +214,21 @@ function reasoningOptions(e) {
 // messages. Aria adds short instructions after the chat history, so for these providers they are
 // folded into the system message and consecutive messages from the same side are joined.
 function prepareMessages(e, system, messages) {
-  if (!e.singleSystem) return [{ role: "system", content: system }, ...messages];
+  if (!e.singleSystem) return system ? [{ role: "system", content: system }, ...messages] : messages;
   const later = messages.filter((m) => m.role === "system").map((m) => m.content);
   const rest = messages.filter((m) => m.role !== "system");
   const merged = [];
   for (const m of rest) {
     const last = merged[merged.length - 1];
-    if (last && last.role === m.role) last.content += `\n${m.content}`;
+    if (last && last.role === m.role && typeof last.content === "string" && typeof m.content === "string") last.content += `\n${m.content}`;
     else merged.push({ role: m.role, content: m.content });
   }
   while (merged.length && merged[0].role !== "user") merged.shift();
   const sys = later.length ? `${system}\n\n=== FOR THIS REPLY ONLY ===\n${later.join("\n\n")}` : system;
-  return [{ role: "system", content: sys }, ...merged];
+  return sys ? [{ role: "system", content: sys }, ...merged] : merged;
 }
 
-async function callEngine(e, { system, messages, maxTokens, temperature }) {
+async function callEngine(e, { system, messages, maxTokens, temperature, json = true }) {
   const s = st(e);
   const body = {
     model: e.model,
@@ -200,7 +237,7 @@ async function callEngine(e, { system, messages, maxTokens, temperature }) {
     ...(e.kind === "groq" ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
     ...reasoningOptions(e),
   };
-  if (e.json && !s.noJson) body.response_format = { type: "json_object" };
+  if (json && e.json && !s.noJson) body.response_format = { type: "json_object" };
 
   let res;
   try {
@@ -235,7 +272,7 @@ async function callEngine(e, { system, messages, maxTokens, temperature }) {
     // A model that does not support JSON mode: try again without it
     if (res.status === 400 && body.response_format && /response_format|json_object|json mode/i.test(message)) {
       s.noJson = true;
-      return callEngine(e, { system, messages, maxTokens, temperature });
+      return callEngine(e, { system, messages, maxTokens, temperature, json });
     }
 
     throw new LlmError(`${e.label}: ${res.status} ${String(message).slice(0, 200)}`, {
@@ -292,7 +329,8 @@ function markOk(e, usage) {
 // The main call
 // ---------------------------------------------------------------------------
 
-function ordered(strong) {
+function ordered(strong, pool = "text") {
+  if (pool === "vision") return VISION_ENGINES.slice();
   if (!strong) return ENGINES.slice();
   return [...ENGINES.filter((e) => e.strongLanguage), ...ENGINES.filter((e) => !e.strongLanguage)];
 }
@@ -300,10 +338,11 @@ function ordered(strong) {
 // Returns { content, finishReason, usage, engine } or throws an LlmError.
 //   strong:  the language is hard, so try the strongest backup model first
 //   exclude: provider ids not to use (for example one that already gave an unusable answer)
-async function chat({ system, messages, maxTokens = 1000, temperature = 0.7, strong = false, exclude = [] }) {
-  const pool = ordered(strong).filter((e) => !exclude.includes(e.id));
+async function chat({ system, messages, maxTokens = 1000, temperature = 0.7, strong = false, exclude = [], pool: poolName = "text", json = true }) {
+  const all = poolName === "vision" ? VISION_ENGINES : ENGINES;
+  const pool = ordered(strong, poolName).filter((e) => !exclude.includes(e.id));
   if (!pool.length) {
-    throw new LlmError(ENGINES.length ? "No other AI provider is available to try." : "No AI provider is set up. Add GROQ_API_KEY.", { kind: "config" });
+    throw new LlmError(all.length ? "No other AI provider is available to try." : poolName === "vision" ? "No picture-reading model is set up. Add GROQ_API_KEY." : "No AI provider is set up. Add GROQ_API_KEY.", { kind: "config" });
   }
 
   let lastErr = null;
@@ -325,7 +364,7 @@ async function chat({ system, messages, maxTokens = 1000, temperature = 0.7, str
 
     for (const e of ready) {
       try {
-        const out = await callEngine(e, { system, messages, maxTokens, temperature });
+        const out = await callEngine(e, { system, messages, maxTokens, temperature, json });
         markOk(e, out.usage);
         return { ...out, engine: e };
       } catch (err) {
@@ -346,8 +385,8 @@ function fmtWait(ms) {
   return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : m > 1 ? `${m} min` : `${Math.max(1, Math.ceil(ms / 1000))}s`;
 }
 
-function status() {
-  return ENGINES.map((e, i) => {
+function status(poolName = "text") {
+  return (poolName === "vision" ? VISION_ENGINES : ENGINES).map((e, i) => {
     const s = st(e);
     const rest = s.cooldownUntil - Date.now();
     return {

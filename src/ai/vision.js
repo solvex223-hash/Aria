@@ -1,11 +1,7 @@
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const llm = require("./llm");
 
-// Comma-separated list of vision models to try in order. Default: qwen/qwen3.8-27b
-const VISION_MODELS = (process.env.GROQ_VISION_MODELS || "qwen/qwen3.8-27b")
-    .split(",")
-    .map((m) => m.trim())
-    .filter(Boolean);
+// Which models are tried (in order) is set in ./llm.js: GROQ_VISION_MODELS, then GROQ_VISION_FALLBACK_MODELS,
+// then Gemini if GEMINI_API_KEY is set.
 
 /**
  * Describes an image using Groq's vision-capable model.
@@ -48,62 +44,31 @@ async function describeImage(imageBuffer, caption = "", mimeType = "image/jpeg",
             : `Describe what's in this image in 1-3 sentences, focusing on anything relevant to a business/customer service context.` + rules;
     }
 
+    // The picture goes through the same switching layer as the chat: if one picture model is at its
+    // limit, the next one is tried (then Gemini, if a key is set), and the reason is written in the logs.
+    const tried = [];
     let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const res = await llm.chat({
+            pool: "vision",
+            system: "",
+            messages: [{ role: "user", content: [{ type: "text", text: prompt }, ...imageParts] }],
+            maxTokens: 500,
+            temperature: 0.2,
+            json: false,
+            exclude: tried,
+        });
 
-    for (const model of VISION_MODELS) {
-        const body = {
-            model,
-            messages: [
-                {
-                    role: "user",
-                    content: [
-                        { type: "text", text: prompt },
-                        ...imageParts
-                    ]
-                }
-            ],
-            max_completion_tokens: 400
-        };
+        // Safety net: remove any leftover thinking tags
+        const cleaned = String(res.content || "").replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+        if (cleaned) return cleaned;
 
-        // Qwen models think by default. Turn thinking off so the whole token budget goes to the description.
-        if (model.startsWith("qwen/")) {
-            body.reasoning_effort = "none";
-            body.reasoning_format = "hidden";
-        }
-        // gpt-oss models also support reasoning_effort
-        if (model.startsWith("openai/gpt-oss")) {
-            body.reasoning_effort = "low";
-        }
-
-        try {
-            const response = await fetch(GROQ_URL, {
-                method: "POST",
-                headers: {
-                    "Authorization": `Bearer ${GROQ_API_KEY}`,
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify(body),
-                signal: AbortSignal.timeout(30000)
-            });
-
-            if (!response.ok) {
-                const errText = await response.text();
-                throw new Error(`Groq vision request failed: ${response.status} ${errText}`);
-            }
-
-            const data = await response.json();
-            const text = data.choices?.[0]?.message?.content || "";
-
-            // Safety net: remove any leftover thinking tags
-            const cleaned = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-            if (cleaned) return cleaned;
-        } catch (err) {
-            lastError = err;
-            console.warn(`⚠️ Vision model ${model} failed: ${err.message}. Trying next...`);
-        }
+        // This model sent nothing usable: try the next one
+        tried.push(res.engine.id);
+        lastError = new llm.LlmError(`${res.engine.label} returned no description`, { kind: "unusable" });
+        console.warn(`⚠️ ${lastError.message}. Trying another picture model...`);
     }
-
-    throw lastError || new Error("All vision models failed");
+    throw lastError;
 }
 
 module.exports = describeImage;
